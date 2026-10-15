@@ -1,0 +1,49 @@
+name: build
+
+# Every push: build the app and keep it as a workflow artifact. A push to main also publishes
+# the app as a GitHub release (v1.0.<run number>, CountdownOverlay.zip), which is what
+# install.sh and the menu's "Check for Updates…" download.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  app-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: Build the app
+        # The branch name goes in through the environment, never pasted into the script: a ref
+        # name may contain $( ) or ; and would otherwise run as shell.
+        env:
+          BRANCH: ${{ github.ref_name }}
+          VERSION: 1.0.${{ github.run_number }}
+        run: |
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          UNIVERSAL=1 scripts/make-app.sh
+      - name: Launches
+        run: |
+          build/CountdownOverlay.app/Contents/MacOS/CountdownOverlay --help
+          lipo -info build/CountdownOverlay.app/Contents/MacOS/CountdownOverlay
+          /usr/libexec/PlistBuddy -c 'Print CountdownCommit' build/CountdownOverlay.app/Contents/Info.plist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CountdownOverlay
+          path: build/CountdownOverlay.zip
+      - name: Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A re-run keeps its run number, so the release may already exist: replace its zip.
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" build/CountdownOverlay.zip --clobber
+          else
+            gh release create "v$VERSION" build/CountdownOverlay.zip --target "$GITHUB_SHA" \
+              --title "CountdownOverlay $VERSION" --notes "$(git log -1 --format=%B)"
+          fi
