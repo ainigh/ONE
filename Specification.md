@@ -95,7 +95,10 @@ A short system sound marks every transition point, so the user hears a change wi
 
 ## 10. Mind map
 
-What blocks the screen in Closed is a mind map the user can work in (`Mind Maps.html`).
+What blocks the screen in Closed is a mind map the user can work in (`Mind Maps.html`). It is also there whenever the screen isn't blocked, from its own menu-bar icon.
+
+- When the screen isn't blocked, the mind-map icon (or **Open Mind Map** in the timer's menu) opens it in an ordinary window, which the user can close at any time. Clicking the icon again closes it.
+- When the screen is blocked, the map moves into the overlay and cannot be closed; an open window steps aside and comes back when the block ends.
 
 - On the main screen (the one with the menu bar), Closed shows the mind map full screen, under a strip with the time left, the reminders (§5) and **I need out** (§6). Other screens keep the dark blocked screen.
 - Confirmations (§3) and the puzzle (§6) cover the mind map while they show; it comes back as it was.

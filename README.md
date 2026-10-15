@@ -8,7 +8,8 @@ and the only way out of Closed early is a small prime-arithmetic puzzle that buy
 pause. A system sound marks every transition point.
 
 In Closed, what covers the main screen is a mind map you can work in (`Mind Maps.html`), under a
-strip with the time left, the reminders and **I need out**.
+strip with the time left, the reminders and **I need out**. The rest of the time it's one click
+away: the second menu-bar icon (the brain) opens it in an ordinary window you can close.
 
 The app is one Swift file, `main.swift`, plus that page, which the build copies into the bundle.
 
