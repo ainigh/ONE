@@ -7,7 +7,10 @@ confirmation box on the blocked screen, reminders announce the time left at halv
 and the only way out of Closed early is a small prime-arithmetic puzzle that buys a 20-minute
 pause. A system sound marks every transition point.
 
-The whole app is one Swift file, `main.swift`.
+In Closed, what covers the main screen is a mind map you can work in (`Mind Maps.html`), under a
+strip with the time left, the reminders and **I need out**.
+
+The app is one Swift file, `main.swift`, plus that page, which the build copies into the bundle.
 
 ## Install
 
@@ -65,7 +68,7 @@ Or just the bare binary, which still works but doesn't check for updates:
 
 ```sh
 swiftc -O -o CountdownOverlay main.swift -framework Cocoa
-./CountdownOverlay
+./CountdownOverlay      # run from the checkout, so it finds Mind Maps.html
 ```
 
 Requires Xcode command line tools (`xcode-select --install`), macOS 11+.
@@ -77,7 +80,9 @@ Requires Xcode command line tools (`xcode-select --install`), macOS 11+.
   (Return works too).
 - **Opened**: the screen is free, the menubar shows `mm:ss` left, and reminders arrive as
   notifications (allow them when macOS asks).
-- **Closed**: the overlay shows `mm:ss` left and the reminders. **I need out** opens the puzzle:
+- **Closed**: the main screen shows the mind map (your maps are kept in
+  `~/Library/Application Support/CountdownOverlay/mindmaps.json` and come back every Closed);
+  the strip above it, and every other screen, show `mm:ss` left and the reminders. **I need out** opens the puzzle:
   a correct answer pauses everything for 20 minutes, three wrong ones disable the button for
   2 minutes. One successful escape per hour; the button is hidden on cooldown.
 - The session ends at the first confirmation after the chosen length. Quit and updates are
@@ -97,7 +102,7 @@ Requires Xcode command line tools (`xcode-select --install`), macOS 11+.
 - Every countdown is derived from a deadline, not a once-per-second tick, so it
   never drifts and resolves correctly if the Mac sleeps mid-mode.
 - While the screen is blocked, key events only reach the overlay windows, which
-  pass Return to their buttons and typing to the puzzle's answer field and swallow
+  pass Return to their buttons and typing to the puzzle's answer field or the mind map, and swallow
   everything else; the app re-activates itself if it loses focus, so Cmd-Q / Esc
   can't slip through via another window.
 - Overlays are rebuilt (coalesced, after a short delay) when displays are

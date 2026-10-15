@@ -130,6 +130,8 @@ kbd{font:inherit}
   .hide-sm{display:none}
 }
 @media (prefers-reduced-motion:reduce){#side{transition:none}}
+/* inside CountdownOverlay's blocked screen: there are no window buttons to fake */
+html.embedded .lights{display:none}
 </style>
 </head>
 <body>
@@ -200,7 +202,12 @@ const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
 const hash=s=>{let h=2166136261;for(const c of s)h=Math.imul(h^c.charCodeAt(0),16777619)>>>0;return h||1};
 const rng=seed=>()=>{seed=Math.imul(seed^(seed>>>15),2246822507)>>>0;seed=(seed^(seed>>>13))>>>0;return (seed%10000)/10000-.5};
 const boxPt=(cx,cy,w,h,tx,ty)=>{const dx=tx-cx,dy=ty-cy;if(!dx&&!dy)return{x:cx,y:cy};const s=Math.min(dx?w/2/Math.abs(dx):1e9,dy?h/2/Math.abs(dy):1e9);return{x:cx+dx*s,y:cy+dy*s}};
-const store={get(k){try{return localStorage.getItem(k)}catch{return null}},set(k,v){try{localStorage.setItem(k,v)}catch{}}};
+// Inside CountdownOverlay the app keeps the maps (window.mindmapSaved is its copy at load);
+// in a browser they stay in localStorage.
+const native=window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.mindmap;
+const store=native
+  ?{get(k){const v=(window.mindmapSaved||{})[k];return v==null?null:v},set(k,v){(window.mindmapSaved=window.mindmapSaved||{})[k]=String(v);native.postMessage({key:k,value:String(v)})}}
+  :{get(k){try{return localStorage.getItem(k)}catch{return null}},set(k,v){try{localStorage.setItem(k,v)}catch{}}};
 
 /* ---------- state ---------- */
 let maps={}, cur=null, sel=null, selNote=null, editing=null, undo=[], redo=[];
@@ -646,6 +653,7 @@ setInterval(()=>{updateTitle();renderList()},60000);
   if(!Object.keys(maps).length){const s=sampleMap();maps[s.id]=s}
   const c=store.get('mm.cur');cur=maps[c]?c:recent()[0].id;
   if(innerWidth<=760)$('#app').classList.add('noside');
+  if(native){document.documentElement.classList.add('embedded');setStatus('ok','Saved on this Mac')}
   openMap(cur);
   if(document.fonts&&document.fonts.ready)document.fonts.ready.then(()=>{render();fit()});
   initDb();

@@ -71,7 +71,7 @@ The only way to leave Closed early.
 ## 8. Edge rules
 
 - Durations are always shown as `mm:ss`.
-- No action is available during a mode except the escape button in Closed.
+- No action is available during a mode except the escape button and the mind map in Closed (§10).
 - If the app is killed or the device restarts mid-session, it reopens to a confirmation for the mode that was interrupted, with its full slot.
 
 ## 9. Sounds
@@ -92,3 +92,13 @@ A short system sound marks every transition point, so the user hears a change wi
 - Sounds are the macOS system sounds of those names; a missing one is simply silent.
 - Sounds are informational only and never replace the confirmation or a reminder's text.
 - Launching with `-mute YES` silences all of them.
+
+## 10. Mind map
+
+What blocks the screen in Closed is a mind map the user can work in (`Mind Maps.html`).
+
+- On the main screen (the one with the menu bar), Closed shows the mind map full screen, under a strip with the time left, the reminders (§5) and **I need out** (§6). Other screens keep the dark blocked screen.
+- Confirmations (§3) and the puzzle (§6) cover the mind map while they show; it comes back as it was.
+- The maps are kept on the Mac (`~/Library/Application Support/CountdownOverlay/mindmaps.json`) and carry over from one Closed to the next, and across sessions.
+- The mind map is a place to think, not a way out: it has no links, and leaves the block timer running.
+- If the page is missing (a bare binary run away from the source), Closed shows the dark blocked screen.
