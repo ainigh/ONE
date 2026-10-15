@@ -353,12 +353,13 @@ enum Theme {
 
     /// A small capsule naming a mode or state: "CLOSED", tinted.
     static func pill(_ text: String, tint: NSColor, size: CGFloat) -> NSView {
-        let label = NSTextField(labelWithString: "")
-        label.attributedStringValue = NSAttributedString(string: text.uppercased(), attributes: [
+        let words = NSAttributedString(string: text.uppercased(), attributes: [
             .font: NSFont.systemFont(ofSize: size, weight: .bold),
             .foregroundColor: tint,
             .kern: size * 0.14,
         ])
+        let label = NSTextField(labelWithString: "")
+        label.attributedStringValue = words
         label.translatesAutoresizingMaskIntoConstraints = false
         label.setContentHuggingPriority(.required, for: .horizontal)
         label.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -374,8 +375,8 @@ enum Theme {
             pill.heightAnchor.constraint(equalToConstant: size * 1.9),
             label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
             label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: size * 0.9),
-            // As wide as its words, wherever it sits (a stack would otherwise stretch it).
-            pill.widthAnchor.constraint(equalTo: label.widthAnchor, constant: size * 1.65),
+            // As wide as its words, measured, wherever it sits (a stack would otherwise stretch it).
+            pill.widthAnchor.constraint(equalToConstant: ceil(words.size().width) + size * 1.9),
         ])
         pill.setAccessibilityElement(true)
         pill.setAccessibilityRole(.staticText)
