@@ -73,3 +73,22 @@ The only way to leave Closed early.
 - Durations are always shown as `mm:ss`.
 - No action is available during a mode except the escape button in Closed.
 - If the app is killed or the device restarts mid-session, it reopens to a confirmation for the mode that was interrupted, with its full slot.
+
+## 9. Sounds
+
+A short system sound marks every transition point, so the user hears a change without looking.
+
+| Transition | Sound |
+|---|---|
+| A confirmation box appears (a mode is about to change, §3) | Glass |
+| Opened starts | Hero |
+| Closed starts | Submarine |
+| A reminder fires (§5) | Tink |
+| A wrong puzzle answer (§6) | Basso |
+| The puzzle is solved and the pause begins (§7) | Pop |
+| The pause ends | Blow |
+| The session ends (§4) | Funk |
+
+- Sounds are the macOS system sounds of those names; a missing one is simply silent.
+- Sounds are informational only and never replace the confirmation or a reminder's text.
+- Launching with `-mute YES` silences all of them.

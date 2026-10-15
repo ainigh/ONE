@@ -1,50 +1,205 @@
 import Cocoa
+import UserNotifications
 
-// MARK: - Configuration
+// MARK: - Model
 
-/// Resolves the countdown length. Precedence: `-duration N` launch argument
-/// (read via UserDefaults' argument domain, so it can also be persisted with
-/// `defaults write <bundle id> duration -int 10`), then `COUNTDOWN_SECONDS`
-/// env var, then the built-in default. Out-of-range values fall back to the
-/// default so a typo can never lock the screen for hours.
+/// The two modes a session alternates between (Specification §1).
+enum Mode: String {
+    case opened, closed
+
+    var title: String { self == .opened ? "Opened" : "Closed" }
+    var other: Mode { self == .opened ? .closed : .opened }
+}
+
 enum Config {
-    static let defaultDuration = 5
-    static let minDuration = 1
-    static let maxDuration = 3600
+    /// Allowed slot values, in minutes (§2).
+    static let slots = [4, 8, 16]
+    static let defaultSlots: [Mode: Int] = [.opened: 16, .closed: 4]
+    /// Session lengths offered at activation, in hours (§4).
+    static let sessionHours = [1, 2, 4, 8]
+    static let pauseMinutes = 20                   // §7
+    static let puzzleAttempts = 3                  // §6
+    static let lockoutMinutes = 2                  // §6: after the third wrong answer
+    static let cooldownMinutes = 60                // §6: one escape per hour
+    static let primeLimit = 50                     // §6: primes below 50
 
-    static var duration: Int {
-        var value = defaultDuration
-        if let env = ProcessInfo.processInfo.environment["COUNTDOWN_SECONDS"],
-           let parsed = Int(env.trimmingCharacters(in: .whitespaces)) {
-            value = parsed
+    /// Real seconds in one of the app's minutes: 60, unless launched with `-minute N` (1...60)
+    /// to try the whole cycle quickly. Every duration in the spec is scaled by it.
+    static var secondsPerMinute: Double {
+        let v = UserDefaults.standard.object(forKey: "minute") != nil
+            ? UserDefaults.standard.integer(forKey: "minute") : 60
+        return (1...60).contains(v) ? Double(v) : 60
+    }
+
+    static var muted: Bool { UserDefaults.standard.bool(forKey: "mute") }
+
+    static func seconds(minutes: Int) -> TimeInterval { Double(minutes) * secondsPerMinute }
+
+    /// `mm:ss` of a real interval, in the app's minutes, rounded up so a full minute reads 01:00.
+    static func clock(_ interval: TimeInterval) -> String {
+        let total = max(0, Int(ceil(interval / secondsPerMinute * 60 - 0.0001)))
+        return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+
+    /// `mm:ss` of a whole number of minutes.
+    static func clock(minutes: Int) -> String { String(format: "%02d:%02d", minutes, 0) }
+
+    /// Reminder marks for a slot (§5): halving intervals, none under one minute from the end.
+    static func reminders(forSlot slot: Int) -> [Int] {
+        var marks: [Int] = []
+        var m = slot / 2
+        while m >= 1 {
+            marks.append(m)
+            m /= 2
         }
-        if UserDefaults.standard.object(forKey: "duration") != nil {
-            value = UserDefaults.standard.integer(forKey: "duration")
-        }
-        return (minDuration...maxDuration).contains(value) ? value : defaultDuration
+        return marks
     }
 
     static let usage = """
-    CountdownOverlay — menubar countdown that covers every screen.
+    CountdownOverlay — the Opened / Closed session timer from Specification.md.
 
-    usage: CountdownOverlay [-duration SECONDS]
+    usage: CountdownOverlay [-minute SECONDS] [-mute YES]
 
-      -duration N   countdown length, \(minDuration)...\(maxDuration) (default \(defaultDuration))
+      -minute N     real seconds per app minute, 1...60 (default 60), to try the cycle quickly
+      -mute YES     no sounds at transitions
       -h, --help    show this help
       --version     print the version and commit this copy was built from
-
-    COUNTDOWN_SECONDS=N in the environment is used when -duration is absent.
     """
+}
+
+/// Sounds at transition points, from the system set in /System/Library/Sounds.
+enum Sound: String {
+    case confirmation = "Glass"       // a confirmation box appears: a mode is about to change
+    case opened = "Hero"              // Opened begins
+    case closed = "Submarine"         // Closed begins
+    case reminder = "Tink"            // a reminder (§5)
+    case wrong = "Basso"              // a wrong puzzle answer
+    case escaped = "Pop"              // the puzzle was solved: the pause begins
+    case pauseOver = "Blow"           // the pause is over: back to a confirmation
+    case sessionOver = "Funk"         // the session has ended
+
+    func play() {
+        guard !Config.muted else { return }
+        // `NSSound(named:)` hands back a shared instance that ignores play() while it is already
+        // playing; a copy plays every time.
+        guard let sound = NSSound(named: NSSound.Name(rawValue))?.copy() as? NSSound else { return }
+        sound.play()
+    }
+}
+
+/// The escape puzzle (§6): two random primes below 50, summed or multiplied.
+struct Puzzle {
+    static let primes: [Int] = (2..<Config.primeLimit).filter { n in
+        !(2..<n).contains(where: { n % $0 == 0 })
+    }
+
+    let question: String
+    let answer: Int
+    var attemptsLeft = Config.puzzleAttempts
+
+    static func random() -> Puzzle {
+        let a = primes.randomElement()!, b = primes.randomElement()!
+        return Bool.random()
+            ? Puzzle(question: "\(a) + \(b) = ?", answer: a + b)
+            : Puzzle(question: "\(a) × \(b) = ?", answer: a * b)
+    }
+}
+
+/// What survives the app being killed or the Mac restarting (§8): enough to reopen to a
+/// confirmation for the interrupted mode, plus the slots and the escape cooldown.
+enum Store {
+    private static let d = UserDefaults.standard
+
+    static var sessionEnd: Date? {
+        get { d.object(forKey: "session.end") as? Date }
+        set { d.set(newValue, forKey: "session.end") }
+    }
+    /// The mode that was running, confirming, or (for a pause) due next.
+    static var interruptedMode: Mode? {
+        get { d.string(forKey: "session.mode").flatMap(Mode.init(rawValue:)) }
+        set { d.set(newValue?.rawValue, forKey: "session.mode") }
+    }
+    static var lastEscape: Date? {
+        get { d.object(forKey: "escape.last") as? Date }
+        set { d.set(newValue, forKey: "escape.last") }
+    }
+    static func slot(for mode: Mode) -> Int {
+        let v = d.integer(forKey: "slot.\(mode.rawValue)")
+        return Config.slots.contains(v) ? v : Config.defaultSlots[mode]!
+    }
+    static func setSlot(_ minutes: Int, for mode: Mode) {
+        d.set(minutes, forKey: "slot.\(mode.rawValue)")
+    }
+    static func clearSession() {
+        sessionEnd = nil
+        interruptedMode = nil
+    }
+}
+
+/// Notifications for Opened-mode reminders (§5) and other things that happen while the screen
+/// isn't blocked. Only an app bundle can post them; a bare binary logs instead.
+enum Notifier {
+    static var available: Bool { Updater.isInstalledApp }
+
+    static func requestPermission() {
+        guard available else { return }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+    }
+
+    static func post(_ title: String, _ body: String) {
+        guard available else {
+            NSLog("%@: %@", title, body)
+            return
+        }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
 }
 
 // MARK: - Overlay window (one per screen)
 
+/// What the blocked screen can show. The clock and status line underneath are set separately,
+/// every tick, without rebuilding the views.
+enum OverlayContent: Equatable {
+    case confirmation(heading: String, mode: Mode, slot: Int)
+    case closed(escape: EscapeState)
+    case puzzle(question: String, note: String)
+}
+
+enum EscapeState: Equatable {
+    case available
+    case disabled                                  // after three wrong answers
+    case hidden                                    // on cooldown
+}
+
+protocol OverlayActions: AnyObject {
+    func overlayChoseSlot(_ minutes: Int)
+    func overlayPressedStart()
+    func overlayPressedEscape()
+    func overlayAnswered(_ text: String)
+    func overlayDismissedPuzzle()
+}
+
 final class OverlayWindow: NSWindow {
-    private let label = NSTextField(labelWithString: "")
+    weak var actions: OverlayActions?
+    private(set) var content: OverlayContent?
+
+    private let clockLabel = NSTextField(labelWithString: "")
+    private let statusLabel = NSTextField(wrappingLabelWithString: "")
+    private let stack = NSStackView()
+    private var answerField: NSTextField?
+    private let headingSize: CGFloat
+    private let textSize: CGFloat
 
     init(screen: NSScreen) {
         // Use the global-coordinate initializer: the `screen:` variant interprets
         // contentRect relative to that screen, which misplaces secondary displays.
+        let shortSide = min(screen.frame.width, screen.frame.height)
+        headingSize = min(max(shortSide * 0.06, 28), 64)
+        textSize = min(max(shortSide * 0.028, 18), 34)
         super.init(contentRect: screen.frame,
                    styleMask: [.borderless],
                    backing: .buffered,
@@ -54,7 +209,7 @@ final class OverlayWindow: NSWindow {
         level = .screenSaver                       // above everything, incl. full-screen apps
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         isOpaque = false
-        backgroundColor = NSColor.black.withAlphaComponent(0.85)
+        backgroundColor = NSColor.black.withAlphaComponent(0.88)
         hasShadow = false
         ignoresMouseEvents = false                 // swallow clicks so they don't fall through
         hidesOnDeactivate = false
@@ -65,42 +220,147 @@ final class OverlayWindow: NSWindow {
 
         // Scale the digits with the screen so they fit on small displays
         // and stay legible on large ones.
-        let shortSide = min(screen.frame.width, screen.frame.height)
-        let fontSize = min(max(shortSide * 0.28, 72), 320)
-        label.font = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .bold)
-        label.textColor = .white
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.setAccessibilityLabel("Countdown")
+        let clockSize = min(max(shortSide * 0.22, 64), 260)
+        clockLabel.font = NSFont.monospacedDigitSystemFont(ofSize: clockSize, weight: .bold)
+        clockLabel.textColor = .white
+        clockLabel.alignment = .center
+        clockLabel.setAccessibilityLabel("Time left")
+
+        statusLabel.font = NSFont.systemFont(ofSize: textSize, weight: .medium)
+        statusLabel.textColor = NSColor.white.withAlphaComponent(0.85)
+        statusLabel.alignment = .center
+        statusLabel.maximumNumberOfLines = 3
+
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = textSize
+        stack.translatesAutoresizingMaskIntoConstraints = false
 
         let content = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
-        content.addSubview(label)
+        content.addSubview(stack)
         NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            stack.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, multiplier: 0.8),
         ])
         contentView = content
     }
 
-    func setRemaining(_ seconds: Int) {
-        let text = "\(seconds)"
-        if label.stringValue != text {
-            label.stringValue = text
+    // MARK: Content
+
+    /// Rebuilds the controls for `content`, unless it is already showing.
+    func show(_ new: OverlayContent) {
+        guard new != content else { return }
+        content = new
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        answerField = nil
+
+        switch new {
+        case let .confirmation(heading, _, slot):
+            stack.addArrangedSubview(label(heading, size: headingSize, weight: .bold))
+            let picker = NSSegmentedControl(labels: Config.slots.map(String.init),
+                                            trackingMode: .selectOne,
+                                            target: self, action: #selector(slotChanged(_:)))
+            picker.font = NSFont.systemFont(ofSize: textSize)
+            picker.controlSize = .large
+            picker.selectedSegment = Config.slots.firstIndex(of: slot) ?? -1
+            picker.setAccessibilityLabel("Minutes")
+            stack.addArrangedSubview(picker)
+            stack.addArrangedSubview(label("minutes", size: textSize * 0.8, weight: .regular))
+            stack.addArrangedSubview(button("Start", key: "\r", action: #selector(startPressed)))
+
+        case let .closed(escape):
+            stack.addArrangedSubview(clockLabel)
+            stack.addArrangedSubview(statusLabel)
+            if escape != .hidden {
+                let out = button("I need out", key: "", action: #selector(escapePressed))
+                out.isEnabled = escape == .available
+                stack.addArrangedSubview(out)
+            }
+
+        case let .puzzle(question, note):
+            stack.addArrangedSubview(clockLabel)
+            stack.addArrangedSubview(label(question, size: headingSize, weight: .bold))
+            let field = NSTextField(string: "")
+            field.font = NSFont.monospacedDigitSystemFont(ofSize: headingSize * 0.8, weight: .regular)
+            field.alignment = .center
+            field.placeholderString = "?"
+            field.setAccessibilityLabel("Answer")
+            field.widthAnchor.constraint(equalToConstant: headingSize * 5).isActive = true
+            stack.addArrangedSubview(field)
+            answerField = field
+            let row = NSStackView(views: [
+                button("Never mind", key: "", action: #selector(dismissPuzzlePressed)),
+                button("Answer", key: "\r", action: #selector(answerPressed)),
+            ])
+            row.orientation = .horizontal
+            row.spacing = textSize
+            stack.addArrangedSubview(row)
+            statusLabel.stringValue = note
+            stack.addArrangedSubview(statusLabel)
         }
+        stack.layoutSubtreeIfNeeded()
     }
+
+    func setClock(_ text: String) {
+        if clockLabel.stringValue != text { clockLabel.stringValue = text }
+    }
+
+    func setStatus(_ text: String) {
+        if statusLabel.stringValue != text { statusLabel.stringValue = text }
+    }
+
+    /// Puts the cursor in the answer field, when the puzzle is showing.
+    func focusAnswer() {
+        if let field = answerField { makeFirstResponder(field) }
+    }
+
+    private func label(_ text: String, size: CGFloat, weight: NSFont.Weight) -> NSTextField {
+        let l = NSTextField(wrappingLabelWithString: text)
+        l.font = NSFont.systemFont(ofSize: size, weight: weight)
+        l.textColor = .white
+        l.alignment = .center
+        return l
+    }
+
+    private func button(_ title: String, key: String, action: Selector) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.bezelStyle = .rounded
+        b.controlSize = .large
+        b.font = NSFont.systemFont(ofSize: textSize)
+        b.keyEquivalent = key
+        return b
+    }
+
+    @objc private func slotChanged(_ sender: NSSegmentedControl) {
+        guard Config.slots.indices.contains(sender.selectedSegment) else { return }
+        actions?.overlayChoseSlot(Config.slots[sender.selectedSegment])
+    }
+    @objc private func startPressed() { actions?.overlayPressedStart() }
+    @objc private func escapePressed() { actions?.overlayPressedEscape() }
+    @objc private func dismissPuzzlePressed() { actions?.overlayDismissedPuzzle() }
+    @objc private func answerPressed() { actions?.overlayAnswered(answerField?.stringValue ?? "") }
+
+    // MARK: Keeping the user in
 
     // Allow the window to take focus so it captures key presses.
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 
-    // Swallow Esc, Cmd-W, Cmd-Q, arrow keys, etc.
+    // Keys that no control claims go nowhere: the window itself swallows them.
     override func keyDown(with event: NSEvent) {}
     override func keyUp(with event: NSEvent) {}
     override func flagsChanged(with event: NSEvent) {}
     override func cancelOperation(_ sender: Any?) {}
-    override func performKeyEquivalent(with event: NSEvent) -> Bool { true }
 
-    // Swallow mouse interaction on the overlay itself.
+    /// Return still reaches the Start / Answer buttons; any Cmd-combination nobody claims
+    /// (Cmd-W, Cmd-Q, Cmd-H…) stops here.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if super.performKeyEquivalent(with: event) { return true }
+        return event.modifierFlags.contains(.command)
+    }
+
+    // Swallow mouse interaction on the overlay itself (controls get theirs first).
     override func mouseDown(with event: NSEvent) {}
     override func rightMouseDown(with event: NSEvent) {}
     override func otherMouseDown(with event: NSEvent) {}
@@ -483,51 +743,67 @@ final class Updater {
     }
 }
 
+
 // MARK: - App delegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, OverlayActions,
+                         UNUserNotificationCenterDelegate {
+    /// Where the session is (§1, §3, §7). Everything else derives from it.
+    enum Phase {
+        case idle
+        case confirming(Mode)                      // blocked, timer frozen
+        case running(Mode, deadline: Date)
+        case paused(until: Date)                   // unblocked, timers frozen
+    }
+
     private var statusItem: NSStatusItem!
+    private let menu = NSMenu()
     private var overlays: [OverlayWindow] = []
     private var timer: Timer?
-    private var deadline: Date?
     private var keyMonitor: Any?
     private var rebuildWork: DispatchWorkItem?
     private var previousApp: NSRunningApplication?
-    private var lastShown = -1
-    private let duration = Config.duration
     private let updater = Updater()
 
-    private var isRunning: Bool { deadline != nil }
+    private var phase: Phase = .idle
+    private var sessionEnd: Date?
+    private var slots: [Mode: Int] = [.opened: Store.slot(for: .opened), .closed: Store.slot(for: .closed)]
+    private var lastEscape: Date? = Store.lastEscape
+    private var escapeLockedUntil: Date?
+    private var puzzle: Puzzle?
+    private var remindersDue: [Int] = []           // minute marks still to announce in this mode
+    private var reminderText = ""
+    private var firstConfirmation = true
 
-    /// Whole seconds left, rounded up so "5" shows for the first full second.
-    private var remainingSeconds: Int {
-        guard let deadline = deadline else { return 0 }
-        return max(0, Int(ceil(deadline.timeIntervalSinceNow)))
+    private var inSession: Bool {
+        if case .idle = phase { return false }
+        return true
     }
+    private var isBlocked: Bool { !overlays.isEmpty }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)      // no Dock icon, menubar only
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            if let image = NSImage(systemSymbolName: "timer", accessibilityDescription: "Countdown") {
+            if let image = NSImage(systemSymbolName: "timer", accessibilityDescription: "Session timer") {
                 image.isTemplate = true
                 button.image = image
+                button.imagePosition = .imageLeading
             } else {
                 button.title = "⏱"                 // fallback if SF Symbols are unavailable
             }
-            button.toolTip = "Countdown Overlay (\(duration)s) — click to start, right-click for menu"
-            button.target = self
-            button.action = #selector(statusItemClicked)
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        menu.delegate = self
+        menu.autoenablesItems = false              // honour the isEnabled flags set in menuNeedsUpdate
+        statusItem.menu = menu
+        updateStatusItem()
+
+        if Notifier.available {
+            UNUserNotificationCenter.current().delegate = self
         }
 
-        updater.onChange = { [weak self] state in
-            guard let button = self?.statusItem?.button else { return }
-            if case .available = state {
-                button.toolTip = "Update available — right-click for menu"
-            }
-        }
+        updater.onChange = { [weak self] _ in self?.updateStatusItem() }
         updater.start()
 
         let center = NotificationCenter.default
@@ -540,49 +816,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                            name: NSApplication.didResignActiveNotification,
                            object: nil)
 
-        // After sleep/wake the deadline may already have passed; resync at once.
+        // After sleep/wake a deadline may already have passed; resync at once.
         NSWorkspace.shared.notificationCenter.addObserver(self,
                                                           selector: #selector(workspaceDidWake(_:)),
                                                           name: NSWorkspace.didWakeNotification,
                                                           object: nil)
+
+        // §8: killed or restarted mid-session → the interrupted mode's confirmation, full slot.
+        if let end = Store.sessionEnd, let mode = Store.interruptedMode {
+            sessionEnd = end
+            firstConfirmation = false
+            startTicking()
+            reachConfirmation(for: mode)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        teardown()
+        unblock()
     }
 
-    // Refuse to quit while the countdown is running.
+    // §4: the session cannot be ended by any other control, quitting included.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        isRunning ? .terminateCancel : .terminateNow
+        inSession ? .terminateCancel : .terminateNow
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
-    // MARK: Menubar interaction
+    // Show reminders even while this app is the active one.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list])
+    }
 
-    @objc private func statusItemClicked() {
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            showMenu()
+    // MARK: Menubar
+
+    private func updateStatusItem() {
+        guard let button = statusItem?.button else { return }
+        let title: String
+        switch phase {
+        case .idle: title = ""
+        case .confirming: title = "Ready?"
+        case let .running(mode, deadline): title = "\(mode.title) \(Config.clock(deadline.timeIntervalSinceNow))"
+        case let .paused(until): title = "Paused \(Config.clock(until.timeIntervalSinceNow))"
+        }
+        if button.title != title { button.title = title }
+        if case .available = updater.state {
+            button.toolTip = "Update available — see the menu"
         } else {
-            startCountdown()
+            button.toolTip = inSession ? "Session running" : "Click to start a session"
         }
     }
 
-    private func showMenu() {
-        let menu = NSMenu()
-        menu.autoenablesItems = false              // honour the isEnabled flags below
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
 
-        let title = menu.addItem(withTitle: isRunning
-                                    ? "Counting down… \(remainingSeconds)s"
-                                    : "Countdown length: \(duration)s",
-                                 action: nil, keyEquivalent: "")
+        let status: String
+        switch phase {
+        case .idle: status = "No session"
+        case let .confirming(mode): status = "Waiting for Start (\(mode.title), \(slots[mode]!) min)"
+        case let .running(mode, deadline): status = "\(mode.title): \(Config.clock(deadline.timeIntervalSinceNow)) left"
+        case let .paused(until): status = "Paused: \(Config.clock(until.timeIntervalSinceNow)) left"
+        }
+        let title = menu.addItem(withTitle: status, action: nil, keyEquivalent: "")
         title.isEnabled = false
+        if let end = sessionEnd {
+            let ends = menu.addItem(withTitle: "Session ends after \(Config.clock(end.timeIntervalSinceNow))",
+                                    action: nil, keyEquivalent: "")
+            ends.isEnabled = false
+        }
         menu.addItem(.separator())
 
-        let start = menu.addItem(withTitle: "Start Countdown",
-                                 action: #selector(startCountdown), keyEquivalent: "")
-        start.target = self
-        start.isEnabled = !isRunning
+        let start = menu.addItem(withTitle: "Start Session", action: nil, keyEquivalent: "")
+        start.isEnabled = !inSession
+        let lengths = NSMenu()
+        lengths.autoenablesItems = false
+        for hours in Config.sessionHours {
+            let item = lengths.addItem(withTitle: hours == 1 ? "1 hour" : "\(hours) hours",
+                                       action: #selector(startSession(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = hours
+            item.isEnabled = !inSession
+        }
+        start.submenu = lengths
 
         menu.addItem(.separator())
         addUpdateItems(to: menu)
@@ -591,11 +907,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quit = menu.addItem(withTitle: "Quit",
                                 action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
-        quit.isEnabled = !isRunning
-
-        statusItem.menu = menu
-        statusItem.button?.performClick(nil)
-        statusItem.menu = nil                      // restore click-to-start behaviour
+        quit.isEnabled = !inSession
     }
 
     // MARK: Updates
@@ -625,8 +937,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case let .buildHere(commit): title = "Update (build here) — \(commit.short): \(commit.title)"
             case .upToDate: title = "Check for Updates…"
             }
-            // Updating restarts the app, which the countdown refuses: offer it only in between.
-            let update = item(title, #selector(installUpdate), enabled: !isRunning)
+            // Updating restarts the app, which a session refuses: offer it only in between.
+            let update = item(title, #selector(installUpdate), enabled: !inSession)
             update.toolTip = "Downloads the new version (or builds it on this Mac when GitHub hasn't), then restarts."
         case .installing(let step):
             item(step, nil, enabled: false)
@@ -640,7 +952,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func checkForUpdates() { updater.check(userInitiated: true) }
 
     @objc private func installUpdate() {
-        guard !isRunning else { return }
+        guard !inSession else { return }
         updater.install()
     }
 
@@ -651,72 +963,253 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pb.setString(Updater.report(message), forType: .string)
     }
 
-    // MARK: Countdown
+    // MARK: Session (§4)
 
-    @objc private func startCountdown() {
-        guard !isRunning else { return }           // ignore clicks mid-countdown
+    @objc private func startSession(_ sender: NSMenuItem) {
+        guard !inSession, Config.sessionHours.contains(sender.tag) else { return }
+        Notifier.requestPermission()
+        sessionEnd = Date().addingTimeInterval(Config.seconds(minutes: sender.tag * 60))
+        Store.sessionEnd = sessionEnd
+        firstConfirmation = true
+        startTicking()
+        reachConfirmation(for: .opened)
+    }
 
-        previousApp = NSWorkspace.shared.frontmostApplication
-        deadline = Date().addingTimeInterval(TimeInterval(duration))
-        lastShown = -1
-        statusItem.button?.appearsDisabled = true
-        NSCursor.hide()
+    /// Every mode change passes through here (§3). The session ends at the first confirmation
+    /// reached after its length has elapsed (§4).
+    private func reachConfirmation(for mode: Mode) {
+        if let end = sessionEnd, Date() >= end {
+            endSession()
+            return
+        }
+        phase = .confirming(mode)
+        Store.interruptedMode = mode
+        puzzle = nil
+        reminderText = ""
+        block()
+        render()
+        Sound.confirmation.play()
+    }
 
-        buildOverlays()
-        updateLabels()
-        regainFocus()
+    private func endSession() {
+        phase = .idle
+        sessionEnd = nil
+        Store.clearSession()
+        puzzle = nil
+        stopTicking()
+        unblock()
+        updateStatusItem()
+        Sound.sessionOver.play()
+        Notifier.post("Session over", "The session length has elapsed.")
+    }
 
-        // Swallow every key event delivered to this process, regardless of
-        // which window is key, so Cmd-Q etc. never reach the responder chain.
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { _ in nil }
+    private func begin(_ mode: Mode) {
+        let slot = slots[mode]!
+        phase = .running(mode, deadline: Date().addingTimeInterval(Config.seconds(minutes: slot)))
+        Store.interruptedMode = mode
+        remindersDue = Config.reminders(forSlot: slot)
+        reminderText = ""
+        puzzle = nil
+        firstConfirmation = false
+        switch mode {
+        case .opened:
+            unblock()
+            Sound.opened.play()
+            Notifier.post("Opened", "\(Config.clock(minutes: slot)) until Closed.")
+        case .closed:
+            block()
+            render()
+            Sound.closed.play()
+        }
+        updateStatusItem()
+    }
 
-        // Tick often and derive the display from the deadline, so the count
-        // never drifts and recovers correctly after the machine sleeps.
+    private func startPause() {
+        phase = .paused(until: Date().addingTimeInterval(Config.seconds(minutes: Config.pauseMinutes)))
+        Store.interruptedMode = .closed            // §7: a pause always leads to Closed
+        puzzle = nil
+        unblock()
+        Sound.escaped.play()
+        Notifier.post("Paused", "\(Config.clock(minutes: Config.pauseMinutes)) until Closed restarts.")
+        updateStatusItem()
+    }
+
+    // MARK: Ticking
+
+    private func startTicking() {
+        guard timer == nil else { return }
+        // Tick often and derive everything from deadlines, so nothing drifts and the state
+        // recovers correctly after the machine sleeps.
         let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
         t.tolerance = 0.02
         RunLoop.main.add(t, forMode: .common)
         timer = t
     }
 
-    @objc private func workspaceDidWake(_ note: Notification) {
-        tick()                                     // finish at once if the deadline passed
-        if isRunning { regainFocus() }
-    }
-    @objc private func appDidResignActive(_ note: Notification) { regainFocus() }
-
-    private func tick() {
-        guard isRunning else { return }
-        if remainingSeconds <= 0 {
-            finish()
-        } else {
-            updateLabels()
-        }
-    }
-
-    private func finish() {
-        teardown()
-
-        // Give focus back to whatever the user was using before we took over.
-        if let app = previousApp, !app.isTerminated, app != NSRunningApplication.current {
-            app.activate(options: [])
-        }
-        previousApp = nil
-    }
-
-    /// Stops the timer and removes all overlays. Safe to call repeatedly.
-    private func teardown() {
+    private func stopTicking() {
         timer?.invalidate()
         timer = nil
-        deadline = nil
+    }
+
+    private func tick() {
+        switch phase {
+        case .idle, .confirming:
+            break                                  // frozen
+        case let .running(mode, deadline):
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 {
+                reachConfirmation(for: mode.other)
+                return
+            }
+            if let mark = remindersDue.first, left <= Config.seconds(minutes: mark) {
+                remindersDue.removeFirst()
+                remind(mode, minutes: mark)
+            }
+            if mode == .closed {
+                // Three wrong answers lock the button for a while; it comes back on its own.
+                if let until = escapeLockedUntil, Date() >= until { escapeLockedUntil = nil }
+                render()
+            }
+        case let .paused(until):
+            if Date() >= until {
+                Sound.pauseOver.play()
+                reachConfirmation(for: .closed)
+                return
+            }
+        }
+        updateStatusItem()
+    }
+
+    /// §5: Opened → a notification; Closed → text on the blocked screen. Informational only.
+    private func remind(_ mode: Mode, minutes: Int) {
+        let left = Config.clock(minutes: minutes)
+        Sound.reminder.play()
+        switch mode {
+        case .opened: Notifier.post("Opened", "\(left) left.")
+        case .closed: reminderText = "\(left) left"
+        }
+    }
+
+    // MARK: Escape puzzle (§6)
+
+    private var escapeState: EscapeState {
+        let now = Date()
+        if let last = lastEscape, now < last.addingTimeInterval(Config.seconds(minutes: Config.cooldownMinutes)) {
+            return .hidden
+        }
+        if let until = escapeLockedUntil, now < until { return .disabled }
+        return .available
+    }
+
+    func overlayPressedEscape() {
+        guard case .running(.closed, _) = phase, puzzle == nil, escapeState == .available else { return }
+        puzzle = Puzzle.random()
+        render()
+    }
+
+    func overlayAnswered(_ text: String) {
+        guard case .running(.closed, _) = phase, var p = puzzle else { return }
+        let answer = Int(text.trimmingCharacters(in: .whitespaces))
+        if answer == p.answer {
+            lastEscape = Date()
+            Store.lastEscape = lastEscape
+            startPause()
+            return
+        }
+        p.attemptsLeft -= 1
+        Sound.wrong.play()
+        if p.attemptsLeft <= 0 {
+            puzzle = nil
+            escapeLockedUntil = Date().addingTimeInterval(Config.seconds(minutes: Config.lockoutMinutes))
+        } else {
+            puzzle = p
+        }
+        render()
+    }
+
+    func overlayDismissedPuzzle() {
+        puzzle = nil
+        render()
+    }
+
+    // MARK: Confirmation (§3)
+
+    func overlayChoseSlot(_ minutes: Int) {
+        guard case let .confirming(mode) = phase, Config.slots.contains(minutes) else { return }
+        slots[mode] = minutes
+        Store.setSlot(minutes, for: mode)
+        render()
+    }
+
+    func overlayPressedStart() {
+        guard case let .confirming(mode) = phase else { return }
+        begin(mode)
+    }
+
+    // MARK: Blocked screen
+
+    /// What the overlays should show for the current phase, and the live clock and status line.
+    private func render() {
+        guard isBlocked else { return }
+        let content: OverlayContent
+        var clock = ""
+        var status = ""
+        switch phase {
+        case let .confirming(mode):
+            let heading = firstConfirmation ? "Ready to start?" : "Ready to switch to \(mode.title)?"
+            content = .confirmation(heading: heading, mode: mode, slot: slots[mode]!)
+        case let .running(.closed, deadline):
+            clock = Config.clock(deadline.timeIntervalSinceNow)
+            if let p = puzzle {
+                let attempts = p.attemptsLeft == Config.puzzleAttempts ? ""
+                    : "Not quite. \(p.attemptsLeft) \(p.attemptsLeft == 1 ? "attempt" : "attempts") left."
+                content = .puzzle(question: p.question, note: attempts)
+                status = attempts
+            } else {
+                content = .closed(escape: escapeState)
+                if let until = escapeLockedUntil, Date() < until {
+                    status = "Three wrong answers. I need out is back in \(Config.clock(until.timeIntervalSinceNow))."
+                } else {
+                    status = reminderText
+                }
+            }
+        default:
+            return
+        }
+        let focusAnswer = overlays.first?.content != content && puzzle != nil
+        for overlay in overlays {
+            overlay.show(content)
+            overlay.setClock(clock)
+            overlay.setStatus(status)
+        }
+        if focusAnswer { overlays.first?.focusAnswer() }
+    }
+
+    private func block() {
+        guard !isBlocked else { return }
+        previousApp = NSWorkspace.shared.frontmostApplication
+        buildOverlays()
+        regainFocus()
+        // Keys for anything but our own windows go nowhere; the overlay windows decide the rest.
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { event in
+            event.window is OverlayWindow ? event : nil
+        }
+    }
+
+    /// Removes all overlays and gives focus back. Safe to call repeatedly.
+    private func unblock() {
         rebuildWork?.cancel()
         rebuildWork = nil
-        NSCursor.unhide()                          // never leave the cursor hidden
-        statusItem?.button?.appearsDisabled = false
         if let monitor = keyMonitor {
             NSEvent.removeMonitor(monitor)
             keyMonitor = nil
         }
+        guard isBlocked else { return }
         closeOverlays()
+        if let app = previousApp, !app.isTerminated, app != NSRunningApplication.current {
+            app.activate(options: [])
+        }
+        previousApp = nil
     }
 
     private func closeOverlays() {
@@ -728,40 +1221,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closeOverlays()
         overlays = NSScreen.screens.map { screen in
             let w = OverlayWindow(screen: screen)
+            w.actions = self
             w.orderFrontRegardless()
             return w
         }
     }
 
-    private func updateLabels() {
-        let value = remainingSeconds
-        guard value != lastShown else { return }
-        lastShown = value
-        overlays.forEach { $0.setRemaining(value) }
-    }
-
-    /// Keeps the overlay key and the app active for as long as the countdown
-    /// runs, so key events keep landing in our swallowing handlers.
+    /// Keeps an overlay key and the app active for as long as the screen is blocked, so key
+    /// events keep landing in our windows.
     private func regainFocus() {
-        guard isRunning else { return }
+        guard isBlocked else { return }
         DispatchQueue.main.async { [weak self] in
-            guard let self = self, self.isRunning else { return }
+            guard let self = self, self.isBlocked else { return }
             NSApp.activate(ignoringOtherApps: true)
             self.overlays.forEach { $0.orderFrontRegardless() }
             self.overlays.first?.makeKey()
+            if self.puzzle != nil { self.overlays.first?.focusAnswer() }
         }
     }
 
-    // Rebuild if a display is plugged/unplugged or resized mid-countdown. These
+    @objc private func workspaceDidWake(_ note: Notification) {
+        tick()                                     // move on at once if a deadline passed
+        regainFocus()
+    }
+    @objc private func appDidResignActive(_ note: Notification) { regainFocus() }
+
+    // Rebuild if a display is plugged/unplugged or resized while blocked. These
     // notifications arrive in bursts, so coalesce them.
     @objc private func screensChanged() {
-        guard isRunning else { return }
+        guard isBlocked else { return }
         rebuildWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self = self, self.isRunning else { return }
-            self.lastShown = -1
+            guard let self = self, self.isBlocked else { return }
             self.buildOverlays()
-            self.updateLabels()
+            self.render()
             self.regainFocus()
         }
         rebuildWork = work
