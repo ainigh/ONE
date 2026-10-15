@@ -1,5 +1,6 @@
 import Cocoa
 import UserNotifications
+import WebKit
 
 // MARK: - Model
 
@@ -159,6 +160,91 @@ enum Notifier {
     }
 }
 
+// MARK: - Mind map (what Closed shows on the main screen, Specification §10)
+
+/// Mind Maps.html in a web view that lives as long as the app, so a map and its undo history
+/// survive from one Closed to the next. The page keeps its maps through `store`, which here posts
+/// them to the app; they're saved in ~/Library/Application Support/CountdownOverlay/mindmaps.json.
+final class MindMap: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    let webView: WKWebView
+    private let page: URL
+    private var saved: [String: String]
+
+    static var fileURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/CountdownOverlay/mindmaps.json")
+    }
+
+    /// make-app.sh copies the page into the bundle; a bare binary looks beside itself and in the
+    /// current directory for the source checkout's copy.
+    static var pageURL: URL? {
+        let fm = FileManager.default
+        let candidates = [
+            Bundle.main.url(forResource: "MindMap", withExtension: "html"),
+            Bundle.main.bundleURL.appendingPathComponent("Mind Maps.html"),
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("Mind Maps.html"),
+            URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("Mind Maps.html"),
+        ]
+        return candidates.compactMap { $0 }.first { fm.fileExists(atPath: $0.path) }
+    }
+
+    /// nil when the page can't be found: Closed then shows the plain dark screen.
+    init?(page: URL? = MindMap.pageURL) {
+        guard let page = page else { return nil }
+        self.page = page
+        saved = (try? Data(contentsOf: Self.fileURL))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] } ?? [:]
+        let config = WKWebViewConfiguration()
+        webView = WKWebView(frame: .zero, configuration: config)
+        super.init()
+        config.userContentController.add(self, name: "mindmap")
+        webView.navigationDelegate = self
+        load()
+    }
+
+    private func load() {
+        let controller = webView.configuration.userContentController
+        controller.removeAllUserScripts()
+        let data = (try? JSONSerialization.data(withJSONObject: saved)) ?? Data("{}".utf8)
+        // The saved maps, before the page's own script reads them. No context menu: its Look Up
+        // and Search items would open other apps behind the overlay.
+        let source = "window.mindmapSaved = \(String(decoding: data, as: UTF8.self));"
+            + "document.addEventListener('contextmenu', e => e.preventDefault());"
+        controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentStart,
+                                              forMainFrameOnly: true))
+        webView.loadFileURL(page, allowingReadAccessTo: page.deletingLastPathComponent())
+    }
+
+    /// Ends a text edit in progress, so the page saves it (it saves when an edit is finished).
+    func commitEdits() {
+        webView.evaluateJavaScript("document.activeElement && document.activeElement.blur()",
+                                   completionHandler: nil)
+    }
+
+    func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard let body = message.body as? [String: Any],
+              let key = body["key"] as? String, let value = body["value"] as? String else { return }
+        saved[key] = value
+        let url = Self.fileURL
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try JSONSerialization.data(withJSONObject: saved).write(to: url, options: .atomic)
+        } catch {
+            NSLog("mind map: couldn't save %@: %@", url.path, error.localizedDescription)
+        }
+    }
+
+    // If the page's process dies, bring it back with what was last saved.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { load() }
+
+    // The page is the whole app: nothing navigates away from it.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        decisionHandler(navigationAction.request.url?.isFileURL == true ? .allow : .cancel)
+    }
+}
+
 // MARK: - Overlay window (one per screen)
 
 /// What the blocked screen can show. The clock and status line underneath are set separately,
@@ -193,6 +279,15 @@ final class OverlayWindow: NSWindow {
     private var answerField: NSTextField?
     private let headingSize: CGFloat
     private let textSize: CGFloat
+
+    // Closed on the main screen (§10): the mind map fills it, under a strip with the clock, the
+    // status line and I need out.
+    private(set) var mindMap: WKWebView?
+    private let mapPane = NSView()
+    private let mapBar = NSStackView()
+    private let mapClock = NSTextField(labelWithString: "")
+    private let mapStatus = NSTextField(labelWithString: "")
+    private let mapEscape = NSButton(title: "I need out", target: nil, action: nil)
 
     init(screen: NSScreen) {
         // Use the global-coordinate initializer: the `screen:` variant interprets
@@ -243,7 +338,61 @@ final class OverlayWindow: NSWindow {
             stack.centerYAnchor.constraint(equalTo: content.centerYAnchor),
             stack.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, multiplier: 0.8),
         ])
+
+        mapClock.font = NSFont.monospacedDigitSystemFont(ofSize: textSize * 1.3, weight: .bold)
+        mapClock.textColor = .white
+        mapClock.setAccessibilityLabel("Time left")
+        mapStatus.font = NSFont.systemFont(ofSize: textSize * 0.8, weight: .medium)
+        mapStatus.textColor = NSColor.white.withAlphaComponent(0.85)
+        mapStatus.lineBreakMode = .byTruncatingTail
+        mapStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        mapEscape.target = self
+        mapEscape.action = #selector(escapePressed)
+        mapEscape.bezelStyle = .rounded
+        mapEscape.font = NSFont.systemFont(ofSize: textSize * 0.8)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        for view in [mapClock, mapStatus, spacer, mapEscape] as [NSView] { mapBar.addArrangedSubview(view) }
+        mapBar.orientation = .horizontal
+        mapBar.spacing = textSize
+        mapBar.edgeInsets = NSEdgeInsets(top: 8, left: textSize, bottom: 8, right: textSize)
+        mapBar.translatesAutoresizingMaskIntoConstraints = false
+        mapPane.wantsLayer = true
+        mapPane.layer?.backgroundColor = NSColor.black.cgColor
+        mapPane.translatesAutoresizingMaskIntoConstraints = false
+        mapPane.isHidden = true
+        mapPane.addSubview(mapBar)
+        content.addSubview(mapPane)
+        NSLayoutConstraint.activate([
+            mapPane.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            mapPane.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            mapPane.topAnchor.constraint(equalTo: content.topAnchor),
+            mapPane.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            mapBar.leadingAnchor.constraint(equalTo: mapPane.leadingAnchor),
+            mapBar.trailingAnchor.constraint(equalTo: mapPane.trailingAnchor),
+            mapBar.topAnchor.constraint(equalTo: mapPane.topAnchor, constant: topInset(of: screen)),
+        ])
         contentView = content
+    }
+
+    /// Room for the camera housing on Macs that have one; nothing else covers the overlay.
+    private func topInset(of screen: NSScreen) -> CGFloat {
+        if #available(macOS 12.0, *) { return screen.safeAreaInsets.top }
+        return 0
+    }
+
+    /// Hosts the mind map here (moving it from wherever it was), for Closed to show.
+    func attachMindMap(_ webView: WKWebView) {
+        webView.removeFromSuperview()
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        mapPane.addSubview(webView)
+        NSLayoutConstraint.activate([
+            webView.topAnchor.constraint(equalTo: mapBar.bottomAnchor),
+            webView.leadingAnchor.constraint(equalTo: mapPane.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: mapPane.trailingAnchor),
+            webView.bottomAnchor.constraint(equalTo: mapPane.bottomAnchor),
+        ])
+        mindMap = webView
     }
 
     // MARK: Content
@@ -254,6 +403,22 @@ final class OverlayWindow: NSWindow {
         content = new
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         answerField = nil
+
+        // Closed with the mind map here: it replaces the dark screen; everything else covers it.
+        if case let .closed(escape) = new, let map = mindMap {
+            mapEscape.isHidden = escape == .hidden
+            mapEscape.isEnabled = escape == .available
+            stack.isHidden = true
+            mapPane.isHidden = false
+            makeFirstResponder(map)
+            return
+        }
+        mapPane.isHidden = true
+        stack.isHidden = false
+        // Keys mustn't keep going to the hidden map (a confirmation or the puzzle covers it).
+        if let map = mindMap, let responder = firstResponder as? NSView, responder.isDescendant(of: map) {
+            makeFirstResponder(nil)
+        }
 
         switch new {
         case let .confirmation(heading, _, slot):
@@ -304,10 +469,12 @@ final class OverlayWindow: NSWindow {
 
     func setClock(_ text: String) {
         if clockLabel.stringValue != text { clockLabel.stringValue = text }
+        if mapClock.stringValue != text { mapClock.stringValue = text }
     }
 
     func setStatus(_ text: String) {
         if statusLabel.stringValue != text { statusLabel.stringValue = text }
+        if mapStatus.stringValue != text { mapStatus.stringValue = text }
     }
 
     /// Puts the cursor in the answer field, when the puzzle is showing.
@@ -353,10 +520,12 @@ final class OverlayWindow: NSWindow {
     override func flagsChanged(with event: NSEvent) {}
     override func cancelOperation(_ sender: Any?) {}
 
-    /// Return still reaches the Start / Answer buttons; any Cmd-combination nobody claims
+    /// Return still reaches the Start / Answer buttons and the mind map gets its shortcuts; the
+    /// Edit menu (cut, copy, paste, select all) comes next; any other Cmd-combination
     /// (Cmd-W, Cmd-Q, Cmd-H…) stops here.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if super.performKeyEquivalent(with: event) { return true }
+        if NSApp.mainMenu?.performKeyEquivalent(with: event) == true { return true }
         return event.modifierFlags.contains(.command)
     }
 
@@ -770,6 +939,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     private var rebuildWork: DispatchWorkItem?
     private var previousApp: NSRunningApplication?
     private let updater = Updater()
+    private var mindMap: MindMap?                  // nil when Mind Maps.html isn't there
 
     private var phase: Phase = .idle
     private var sessionEnd: Date?
@@ -805,6 +975,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         menu.autoenablesItems = false              // honour the isEnabled flags set in menuNeedsUpdate
         statusItem.menu = menu
         updateStatusItem()
+        installEditMenu()
+        // Loaded now, so it's ready the first time Closed shows it.
+        mindMap = MindMap()
 
         if Notifier.available {
             UNUserNotificationCenter.current().delegate = self
@@ -867,6 +1040,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
                                 willPresent notification: UNNotification,
                                 withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         completionHandler([.banner, .list])
+    }
+
+    /// Never shown (the app has no menu bar of its own), but it's what makes Cmd-X / C / V / A
+    /// work in the mind map and the puzzle's answer field. Deliberately no Quit.
+    private func installEditMenu() {
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let item = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        item.submenu = edit
+        let main = NSMenu()
+        main.addItem(item)
+        NSApp.mainMenu = main
     }
 
     // MARK: Menubar
@@ -1238,6 +1426,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     }
 
     private func closeOverlays() {
+        if let map = mindMap, map.webView.superview != nil {
+            map.commitEdits()
+            map.webView.removeFromSuperview()
+        }
         overlays.forEach { $0.close() }
         overlays.removeAll()
     }
@@ -1250,6 +1442,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
             w.orderFrontRegardless()
             return w
         }
+        // §10: the main screen (the first one, with the menu bar) holds the mind map.
+        if let map = mindMap { overlays.first?.attachMindMap(map.webView) }
     }
 
     /// Keeps an overlay key and the app active for as long as the screen is blocked, so key

@@ -1,5 +1,5 @@
 # CountdownOverlay — everything needs only the Xcode command-line tools.
-#   make build    compile the bare binary (build/CountdownOverlay)
+#   make build    compile the bare binary (build/CountdownOverlay; run it from here to find the mind map)
 #   make app      assemble + ad-hoc sign build/CountdownOverlay.app (and the .zip)
 #   make run      build the app and open it
 #   make install  install into ~/Applications (same place install.sh uses) and open it
@@ -13,7 +13,7 @@ DEST := $(HOME)/Applications/$(NAME).app
 
 build:
 	mkdir -p build
-	swiftc -O -o build/$(NAME) main.swift -framework Cocoa -framework UserNotifications
+	swiftc -O -o build/$(NAME) main.swift -framework Cocoa -framework UserNotifications -framework WebKit
 
 app:
 	scripts/make-app.sh
