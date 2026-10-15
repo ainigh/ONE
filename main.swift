@@ -102,6 +102,7 @@ enum Config {
       -minute N       real seconds per app minute, 1...60 (default 60), to try the cycle quickly
       -mute YES       no sounds at transitions
       -soundBoost N   how much louder than the system the sounds play, 0...24 dB (default 18)
+      -preview DIR    draw the blocked screens, a pop-up and the menu into PNGs in DIR, then quit
       -h, --help      show this help
       --version       print the version and commit this copy was built from
     """
@@ -1703,6 +1704,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)      // no Dock icon, menubar only
+        if let dir = UserDefaults.standard.string(forKey: "preview"), !dir.isEmpty {
+            runPreviews(into: URL(fileURLWithPath: dir))
+            return
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -1799,6 +1804,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         main.addItem(windowItem)
         main.addItem(item)
         NSApp.mainMenu = main
+    }
+
+    // MARK: Previews
+
+    /// `-preview DIR` draws the blocked screens, a pop-up, the menu's header and the menu-bar
+    /// icons into PNGs in DIR, then quits. CI runs it, so every build leaves pictures of its UI.
+    /// Nothing about a real session is touched: it plays muted and stores nothing it keeps.
+    private func runPreviews(into dir: URL) {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        UserDefaults.standard.set(true, forKey: "mute")
+        func save(_ view: NSView?, _ name: String) {
+            guard let view = view else { return }
+            view.layoutSubtreeIfNeeded()
+            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(name + ".png"))
+        }
+        var steps: [() -> Void] = [
+            {
+                self.sessionEnd = Date().addingTimeInterval(Config.seconds(minutes: 90))
+                self.firstConfirmation = false
+                self.reachConfirmation(for: .closed)
+            },
+            { save(self.overlays.first?.contentView, "1-confirmation") },
+            {
+                Store.closedRounds = 2
+                self.begin(.closed)
+                self.remind(.closed, minutes: 2)
+                self.render()
+            },
+            {
+                save(self.overlays.first?.contentView, "2-closed")
+                Popup.shared.show("02:00", "left in Closed. Then the screen opens again.",
+                                  symbol: "bell.fill", tint: Theme.closed)
+            },
+            {
+                save(NSApp.windows.first { $0 is PopupPanel }?.contentView, "3-popup")
+                self.puzzle = Puzzle(question: "23 × 7 = ?", answer: 161)
+                self.render()
+            },
+            { save(self.overlays.first?.contentView, "4-puzzle") },
+            {
+                self.overlayAnswered("150")
+            },
+            {
+                save(self.overlays.first?.contentView, "5-puzzle-wrong")
+                for (name, appearance) in [("6-menu-dark", NSAppearance.Name.darkAqua), ("6-menu-light", .aqua)] {
+                    self.menuHeader.appearance = NSAppearance(named: appearance)
+                    self.refreshMenuHeader()
+                    let backdrop = NSView(frame: self.menuHeader.frame)
+                    backdrop.appearance = NSAppearance(named: appearance)
+                    backdrop.wantsLayer = true
+                    backdrop.layer?.backgroundColor = (appearance == .darkAqua ? NSColor(white: 0.16, alpha: 1)
+                                                                               : NSColor(white: 0.96, alpha: 1)).cgColor
+                    backdrop.addSubview(self.menuHeader)
+                    save(backdrop, name)
+                    self.menuHeader.removeFromSuperview()
+                }
+                let kinds: [StatusIcon.Kind] = [.idle, .ready, .left(48), .left(36), .left(24), .left(12), .left(3), .paused]
+                let strip = NSView(frame: NSRect(x: 0, y: 0, width: kinds.count * 40 + 8, height: 40))
+                strip.wantsLayer = true
+                strip.layer?.backgroundColor = NSColor.white.cgColor
+                for (i, kind) in kinds.enumerated() {
+                    let image = StatusIcon.image(kind).copy() as! NSImage
+                    image.isTemplate = false
+                    let view = NSImageView(frame: NSRect(x: 8 + i * 40, y: 4, width: 32, height: 32))
+                    view.image = image
+                    view.imageScaling = .scaleProportionallyUpOrDown
+                    strip.addSubview(view)
+                }
+                save(strip, "7-menu-bar-icons")
+                Store.clearSession()
+                UserDefaults.standard.removeObject(forKey: "mute")
+                exit(0)
+            },
+        ]
+        func next() {
+            guard !steps.isEmpty else { return }
+            steps.removeFirst()()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { next() }
+        }
+        next()
     }
 
     // MARK: Open at Login

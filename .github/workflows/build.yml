@@ -34,10 +34,22 @@ jobs:
           test -s build/CountdownOverlay.app/Contents/Resources/Canvas.html
           test -s build/CountdownOverlay.app/Contents/Resources/AppIcon.icns
           /usr/libexec/PlistBuddy -c 'Print CountdownCommit' build/CountdownOverlay.app/Contents/Info.plist
+      - name: Pictures of the UI
+        # Draws each blocked screen, a pop-up, the menu header and the menu-bar icons to PNGs
+        # (-preview), so a change to the look can be checked without a Mac at hand.
+        continue-on-error: true
+        run: |
+          perl -e 'alarm 90; exec @ARGV' build/CountdownOverlay.app/Contents/MacOS/CountdownOverlay -preview "$PWD/build/previews"
+          ls -la build/previews
       - uses: actions/upload-artifact@v4
         with:
           name: CountdownOverlay
           path: build/CountdownOverlay.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: previews
+          path: build/previews
+          if-no-files-found: ignore
       - name: Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
