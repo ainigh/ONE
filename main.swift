@@ -245,6 +245,45 @@ final class MindMap: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     }
 }
 
+/// The mind map as an ordinary window, opened from its menu-bar icon while the screen isn't
+/// blocked (§10). Closing it only hides it: the map lives on in the shared web view, which moves
+/// into the overlay whenever the screen is blocked.
+final class MindMapWindow: NSWindow, NSWindowDelegate {
+    private let mindMap: MindMap
+
+    init(mindMap: MindMap) {
+        self.mindMap = mindMap
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 680),
+                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                   backing: .buffered,
+                   defer: false)
+        title = "Mind Maps"
+        isReleasedWhenClosed = false
+        minSize = NSSize(width: 480, height: 360)
+        contentView = NSView()
+        delegate = self
+        center()
+        setFrameAutosaveName("MindMapWindow")       // reopens where it was last left
+    }
+
+    /// Takes the web view back (from the overlay, or wherever it was).
+    func attach() {
+        let web = mindMap.webView
+        guard let content = contentView, web.superview !== content else { return }
+        web.removeFromSuperview()
+        web.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(web)
+        NSLayoutConstraint.activate([
+            web.topAnchor.constraint(equalTo: content.topAnchor),
+            web.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            web.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            web.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+        ])
+    }
+
+    func windowWillClose(_ notification: Notification) { mindMap.commitEdits() }
+}
+
 // MARK: - Overlay window (one per screen)
 
 /// What the blocked screen can show. The clock and status line underneath are set separately,
@@ -519,6 +558,7 @@ final class OverlayWindow: NSWindow {
     override func keyUp(with event: NSEvent) {}
     override func flagsChanged(with event: NSEvent) {}
     override func cancelOperation(_ sender: Any?) {}
+    override func performClose(_ sender: Any?) {}  // Cmd-W from the main menu: not here
 
     /// Return still reaches the Start / Answer buttons and the mind map gets its shortcuts; the
     /// Edit menu (cut, copy, paste, select all) comes next; any other Cmd-combination
@@ -940,6 +980,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     private var previousApp: NSRunningApplication?
     private let updater = Updater()
     private var mindMap: MindMap?                  // nil when Mind Maps.html isn't there
+    private var mapItem: NSStatusItem?             // the mind map's own menu-bar icon
+    private var mapWindow: MindMapWindow?
+    private var mapWindowWasOpen = false           // reopen it when the screen unblocks
 
     private var phase: Phase = .idle
     private var sessionEnd: Date?
@@ -975,9 +1018,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         menu.autoenablesItems = false              // honour the isEnabled flags set in menuNeedsUpdate
         statusItem.menu = menu
         updateStatusItem()
-        installEditMenu()
+        installMainMenu()
         // Loaded now, so it's ready the first time Closed shows it.
         mindMap = MindMap()
+        if mindMap != nil { addMapStatusItem() }
 
         if Notifier.available {
             UNUserNotificationCenter.current().delegate = self
@@ -1042,9 +1086,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         completionHandler([.banner, .list])
     }
 
-    /// Never shown (the app has no menu bar of its own), but it's what makes Cmd-X / C / V / A
-    /// work in the mind map and the puzzle's answer field. Deliberately no Quit.
-    private func installEditMenu() {
+    /// Never shown (the app has no menu bar of its own), but it's what makes Cmd-W close the mind
+    /// map's window and Cmd-X / C / V / A work in the mind map and the puzzle's answer field.
+    /// Deliberately no Quit; the overlay ignores Close.
+    private func installMainMenu() {
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        let windowItem = NSMenuItem(title: "Window", action: nil, keyEquivalent: "")
+        windowItem.submenu = windowMenu
+
         let edit = NSMenu(title: "Edit")
         edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
@@ -1053,8 +1103,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         let item = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
         item.submenu = edit
         let main = NSMenu()
+        main.addItem(windowItem)
         main.addItem(item)
         NSApp.mainMenu = main
+    }
+
+    // MARK: Mind map window (§10)
+
+    private func addMapStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let button = item.button {
+            if let image = NSImage(systemSymbolName: "brain", accessibilityDescription: "Mind map") {
+                image.isTemplate = true
+                button.image = image
+            } else {
+                button.title = "✦"                 // fallback if SF Symbols are unavailable
+            }
+            button.toolTip = "Mind map"
+            button.target = self
+            button.action = #selector(toggleMindMap)
+        }
+        mapItem = item
+    }
+
+    /// Opens the mind map's window, or closes it when it's already in front. While the screen is
+    /// blocked the overlay shows the map instead, and nothing closes it.
+    @objc private func toggleMindMap() {
+        guard !isBlocked, let map = mindMap else { return }
+        if let window = mapWindow, window.isVisible, window.isKeyWindow, NSApp.isActive {
+            window.performClose(nil)
+            return
+        }
+        showMapWindow(map)
+    }
+
+    @objc private func openMindMap() {
+        guard !isBlocked, let map = mindMap else { return }
+        showMapWindow(map)
+    }
+
+    private func showMapWindow(_ map: MindMap) {
+        let window = mapWindow ?? MindMapWindow(mindMap: map)
+        mapWindow = window
+        window.attach()
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(map.webView)
     }
 
     // MARK: Menubar
@@ -1112,6 +1207,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
         menu.addItem(.separator())
         addUpdateItems(to: menu)
+
+        if mindMap != nil {
+            menu.addItem(.separator())
+            let open = menu.addItem(withTitle: "Open Mind Map", action: #selector(openMindMap), keyEquivalent: "")
+            open.target = self
+            open.isEnabled = !isBlocked
+        }
 
         menu.addItem(.separator())
         let quit = menu.addItem(withTitle: "Quit",
@@ -1401,6 +1503,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     private func block() {
         guard !isBlocked else { return }
         previousApp = NSWorkspace.shared.frontmostApplication
+        // The map's window steps aside: the overlay takes the map, and nothing closes it there.
+        mapWindowWasOpen = mapWindow?.isVisible ?? false
+        mapWindow?.orderOut(nil)
         buildOverlays()
         regainFocus()
         // Keys for anything but our own windows go nowhere; the overlay windows decide the rest.
@@ -1419,6 +1524,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         }
         guard isBlocked else { return }
         closeOverlays()
+        // The map goes back to its window (open, or minimized in the Dock), which reappears if it
+        // was open before, under whatever app was in front.
+        if let window = mapWindow {
+            window.attach()
+            if mapWindowWasOpen { window.orderFront(nil) }
+        }
+        mapWindowWasOpen = false
         if let app = previousApp, !app.isTerminated, app != NSRunningApplication.current {
             app.activate(options: [])
         }
@@ -1426,7 +1538,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     }
 
     private func closeOverlays() {
-        if let map = mindMap, map.webView.superview != nil {
+        if let map = mindMap, map.webView.window is OverlayWindow {
             map.commitEdits()
             map.webView.removeFromSuperview()
         }
