@@ -19,9 +19,10 @@ jobs:
       - run: swift --version
       - name: Build the app
         # The branch name goes in through the environment, never pasted into the script: a ref
-        # name may contain $( ) or ; and would otherwise run as shell.
+        # name may contain $( ) or ; and would otherwise run as shell. On a pull request ref_name
+        # is "N/merge", which isn't a branch the updater could follow; head_ref is.
         env:
-          BRANCH: ${{ github.ref_name }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
           VERSION: 1.0.${{ github.run_number }}
         run: |
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"

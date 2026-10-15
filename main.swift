@@ -375,7 +375,7 @@ final class OverlayWindow: NSWindow {
 /// otherwise it downloads the source and builds it here with Apple's command line tools, so an
 /// update never has to wait for GitHub Actions. The repository is public, so plain HTTPS is enough.
 final class Updater {
-    static let repo = "ainigh/ONE-FILE-SWIFT"
+    static let repo = "ainigh/ONE"
     static let appName = "CountdownOverlay.app"
     static let assetName = "CountdownOverlay.zip"
     static let checkInterval: TimeInterval = 6 * 3600
@@ -449,6 +449,12 @@ final class Updater {
         case .checking, .installing: return true
         default: return false
         }
+    }
+
+    /// Installing ends in a restart, which a session would refuse.
+    var isInstalling: Bool {
+        if case .installing = state { return true }
+        return false
     }
 
     func start() {
@@ -774,6 +780,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     private var remindersDue: [Int] = []           // minute marks still to announce in this mode
     private var reminderText = ""
     private var firstConfirmation = true
+    private var systemIsPoweringOff = false        // a logout / restart / shutdown is under way
 
     private var inSession: Bool {
         if case .idle = phase { return false }
@@ -821,6 +828,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
                                                           selector: #selector(workspaceDidWake(_:)),
                                                           name: NSWorkspace.didWakeNotification,
                                                           object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self,
+                                                          selector: #selector(workspaceWillPowerOff(_:)),
+                                                          name: NSWorkspace.willPowerOffNotification,
+                                                          object: nil)
 
         // §8: killed or restarted mid-session → the interrupted mode's confirmation, full slot.
         if let end = Store.sessionEnd, let mode = Store.interruptedMode {
@@ -835,9 +846,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         unblock()
     }
 
-    // §4: the session cannot be ended by any other control, quitting included.
+    // §4: the session cannot be ended by any other control, quitting included. A logout, restart
+    // or shutdown still goes ahead (refusing it would stall the Mac); §8 reopens the session after.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        inSession ? .terminateCancel : .terminateNow
+        inSession && !systemIsPoweringOff ? .terminateCancel : .terminateNow
+    }
+
+    @objc private func workspaceWillPowerOff(_ note: Notification) {
+        systemIsPoweringOff = true
+        // If another app cancels the logout, quitting is refused again.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
+            self?.systemIsPoweringOff = false
+        }
     }
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
@@ -887,8 +907,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         }
         menu.addItem(.separator())
 
+        // Not while an update installs: it ends in a restart, which a session would refuse.
+        let canStart = !inSession && !updater.isInstalling
         let start = menu.addItem(withTitle: "Start Session", action: nil, keyEquivalent: "")
-        start.isEnabled = !inSession
+        start.isEnabled = canStart
         let lengths = NSMenu()
         lengths.autoenablesItems = false
         for hours in Config.sessionHours {
@@ -896,7 +918,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
                                        action: #selector(startSession(_:)), keyEquivalent: "")
             item.target = self
             item.tag = hours
-            item.isEnabled = !inSession
+            item.isEnabled = canStart
         }
         start.submenu = lengths
 
@@ -966,7 +988,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     // MARK: Session (§4)
 
     @objc private func startSession(_ sender: NSMenuItem) {
-        guard !inSession, Config.sessionHours.contains(sender.tag) else { return }
+        guard !inSession, !updater.isInstalling, Config.sessionHours.contains(sender.tag) else { return }
         Notifier.requestPermission()
         sessionEnd = Date().addingTimeInterval(Config.seconds(minutes: sender.tag * 60))
         Store.sessionEnd = sessionEnd
@@ -1061,10 +1083,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
                 reachConfirmation(for: mode.other)
                 return
             }
-            if let mark = remindersDue.first, left <= Config.seconds(minutes: mark) {
+            // After a sleep several marks may have passed at once: announce only the latest.
+            var passed: Int?
+            while let mark = remindersDue.first, left <= Config.seconds(minutes: mark) {
                 remindersDue.removeFirst()
-                remind(mode, minutes: mark)
+                passed = mark
             }
+            if let mark = passed { remind(mode, minutes: mark) }
             if mode == .closed {
                 // Three wrong answers lock the button for a while; it comes back on its own.
                 if let until = escapeLockedUntil, Date() >= until { escapeLockedUntil = nil }
@@ -1109,7 +1134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     func overlayAnswered(_ text: String) {
         guard case .running(.closed, _) = phase, var p = puzzle else { return }
-        let answer = Int(text.trimmingCharacters(in: .whitespaces))
+        let answer = Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
         if answer == p.answer {
             lastEscape = Date()
             Store.lastEscape = lastEscape

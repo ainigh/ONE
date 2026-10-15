@@ -2,14 +2,14 @@
 # Installs (or reinstalls) CountdownOverlay.app into ~/Applications, then opens it. After this,
 # updates come from the menu-bar icon (right-click → Check for Updates…).
 #
-#   curl -fsSL https://raw.githubusercontent.com/ainigh/ONE-FILE-SWIFT/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ainigh/ONE/main/install.sh | bash
 #
 # It takes the latest release GitHub built. If there isn't one (or FROM_SOURCE=1), it downloads
 # the source of main (BRANCH=name for another branch) and builds it here with Apple's command
 # line tools. The app then follows that branch for updates.
 set -euo pipefail
 
-REPO="ainigh/ONE-FILE-SWIFT"
+REPO="ainigh/ONE"
 BRANCH="${BRANCH:-main}"
 APPS="${HOME:?}/Applications"
 NAME="CountdownOverlay"
