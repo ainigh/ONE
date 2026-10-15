@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Canvas</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* Tokens follow "example style for node.md": a dark green-grey ground, raised cards with a grab
+   strip on the right, and the group colours as tints. */
+:root{
+  color-scheme:dark;
+  --font-ui:"Instrument Sans","Inter Variable","Inter",ui-sans-serif,system-ui,-apple-system,sans-serif;
+  --bg:#141917; --raised:#232a27; --line:#2d3531; --line-strong:#3f4944;
+  --ink:#e5eae6; --ink-2:#b7c0ba; --muted:#8d9a93; --faint:#5f6b65;
+  --accent:#6fc3ad; --accent-ink:#0f2a24; --rust:#d6735c; --dot:#252d29;
+  --shadow-1:0 1px 2px rgba(0,0,0,.3);
+  --shadow-2:0 2px 6px rgba(0,0,0,.35),0 8px 24px -12px rgba(0,0,0,.6);
+  --shadow-3:0 12px 40px -16px rgba(0,0,0,.8),0 2px 8px rgba(0,0,0,.4);
+  --tint:.16;
+  --r-sm:6px; --r-md:10px; --r-lg:16px; --r-pill:999px; --strip:30px;
+}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]){color-scheme:light;--bg:#eef1ef;--raised:#ffffff;--line:#dde3df;--line-strong:#c3ccc7;--ink:#18201c;--ink-2:#3c4842;--muted:#66736c;--faint:#9aa59f;--accent:#2f8f78;--accent-ink:#ffffff;--rust:#c1543c;--dot:#d6ddd9;--shadow-1:0 1px 2px rgba(0,0,0,.08);--shadow-2:0 2px 6px rgba(0,0,0,.08),0 8px 24px -12px rgba(0,0,0,.2);--shadow-3:0 12px 40px -16px rgba(0,0,0,.3),0 2px 8px rgba(0,0,0,.1);--tint:.22}
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.45 var(--font-ui);letter-spacing:-.012em;-webkit-font-smoothing:antialiased;overflow:hidden;user-select:none;-webkit-user-select:none}
+button{font:inherit;color:inherit}
+
+/* the infinite canvas: #view takes the pointer, #world carries the surfaces and moves with pan/zoom */
+#view{position:fixed;inset:0;overflow:hidden;touch-action:none;cursor:default;background-color:var(--bg);background-image:radial-gradient(circle,var(--dot) 1.2px,transparent 1.4px)}
+#view.panning{cursor:grabbing}
+#world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
+
+/* a surface: write straight on it; drag it by its edge or the strip; resize from the corner */
+.surface{position:absolute;display:flex;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--raised);box-shadow:var(--shadow-1);padding:14px calc(var(--strip) + 6px) 14px 16px;cursor:grab;touch-action:none}
+.surface:hover{box-shadow:var(--shadow-2)}
+.surface.dragging{cursor:grabbing;box-shadow:var(--shadow-3)}
+.surface:focus-within{border-color:var(--accent);box-shadow:var(--shadow-2),0 0 0 3px rgba(111,195,173,.22)}
+.surface textarea{flex:1;min-width:0;width:100%;height:100%;border:0;outline:0;resize:none;background:transparent;color:var(--ink);font:inherit;line-height:1.45;padding:0;margin:0;cursor:text;user-select:text;-webkit-user-select:text;overflow:auto;scrollbar-width:thin}
+.surface textarea::placeholder{color:var(--faint)}
+.strip{position:absolute;top:0;right:0;bottom:0;width:var(--strip);display:flex;flex-direction:column;align-items:center;gap:4px;padding:8px 0 20px;border-left:1px solid var(--line);opacity:.45;transition:opacity .12s}
+.surface:hover .strip,.surface:focus-within .strip,.surface.dragging .strip{opacity:1}
+.strip button{width:22px;height:22px;border:0;border-radius:var(--r-sm);background:transparent;display:grid;place-items:center;cursor:pointer;color:var(--muted);padding:0}
+.strip button:hover{background:rgba(127,127,127,.16);color:var(--ink)}
+.strip button svg{width:14px;height:14px}
+.strip .swatch i{width:12px;height:12px;border-radius:50%;border:1.5px solid var(--line-strong);display:block}
+.strip .del.confirm{background:var(--rust);color:#fff}
+.grip{flex:1;width:100%;display:grid;place-items:center;color:var(--faint)}
+.grip svg{width:10px;height:18px}
+.resize{position:absolute;z-index:2;right:0;bottom:0;width:18px;height:18px;cursor:nwse-resize;background:linear-gradient(135deg,transparent 50%,var(--line-strong) 50%,var(--line-strong) 58%,transparent 58%,transparent 70%,var(--line-strong) 70%,var(--line-strong) 78%,transparent 78%)}
+
+/* colour picker */
+#palette{position:fixed;z-index:30;display:none;grid-template-columns:repeat(7,22px);gap:6px;padding:10px;background:var(--raised);border:1px solid var(--line-strong);border-radius:var(--r-md);box-shadow:var(--shadow-3)}
+#palette.open{display:grid}
+#palette button{width:22px;height:22px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0}
+#palette button.on{border-color:var(--ink)}
+#palette button.none{background:var(--raised);box-shadow:inset 0 0 0 1.5px var(--line-strong)}
+
+/* floating controls */
+#tools{position:fixed;right:16px;bottom:16px;z-index:20;display:flex;align-items:center;gap:2px;padding:4px;background:var(--raised);border:1px solid var(--line);border-radius:var(--r-pill);box-shadow:var(--shadow-2)}
+#tools button{height:30px;min-width:30px;border:0;background:transparent;border-radius:var(--r-pill);cursor:pointer;color:var(--ink-2);display:flex;align-items:center;justify-content:center;gap:6px;padding:0 8px}
+#tools button:hover{background:rgba(127,127,127,.16);color:var(--ink)}
+#tools svg{width:16px;height:16px}
+#tools .sep{width:1px;height:18px;background:var(--line);margin:0 4px}
+#zoom{font-size:12px;font-variant-numeric:tabular-nums;min-width:48px}
+#new{font-weight:600;color:var(--ink)!important}
+#hint{position:fixed;inset:0;display:grid;place-items:center;pointer-events:none;color:var(--muted);font-size:17px;text-align:center}
+#hint b{color:var(--ink-2);font-weight:600}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:25;display:none;align-items:center;gap:12px;padding:8px 8px 8px 14px;background:var(--raised);border:1px solid var(--line-strong);border-radius:var(--r-pill);box-shadow:var(--shadow-3);font-size:13px;color:var(--ink-2)}
+#toast.open{display:flex}
+#toast button{border:0;background:var(--accent);color:var(--accent-ink);font-weight:600;border-radius:var(--r-pill);padding:4px 12px;cursor:pointer}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+</style>
+</head>
+<body>
+<div id="view"><div id="world"></div></div>
+<div id="hint"><div><b>Double-click anywhere</b> to start a surface.<br>Drag empty space to move around · pinch or ⌘-scroll to zoom</div></div>
+<div id="palette" role="dialog" aria-label="Surface colour"></div>
+<div id="toast" role="status"><span>Surface deleted</span><button id="undoDel">Undo</button></div>
+<div id="tools">
+  <button id="new" title="New surface"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>Surface</button>
+  <span class="sep"></span>
+  <button id="out" title="Zoom out" aria-label="Zoom out"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 8h10"/></svg></button>
+  <button id="zoom" title="Actual size">100%</button>
+  <button id="in" title="Zoom in" aria-label="Zoom in"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg></button>
+  <button id="fit" title="Show all surfaces" aria-label="Show all surfaces"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"/></svg></button>
+</div>
+<script>
+'use strict';
+const $=s=>document.querySelector(s);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const nid=()=>Math.random().toString(36).slice(2,10);
+
+// Inside CountdownOverlay the app keeps the canvas (window.canvasSaved is its copy at load);
+// in a browser it stays in localStorage.
+const native=window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.canvas;
+const store=native
+  ?{get(k){const v=(window.canvasSaved||{})[k];return v==null?null:v},set(k,v){(window.canvasSaved=window.canvasSaved||{})[k]=String(v);native.postMessage({key:k,value:String(v)})}}
+  :{get(k){try{return localStorage.getItem(k)}catch{return null}},set(k,v){try{localStorage.setItem(k,v)}catch{}}};
+const KEY='canvas.v1';
+
+// The group colours from the style sheet; a surface is tinted with one, or left plain.
+const COLORS=['#93a5b3','#73aee3','#8f95ec','#b08ce6','#d081c6','#ec8aa5','#e3846b','#eba35a','#dcb85a','#b0bd62','#78b885','#62c2c0'];
+const MIN_W=160, MIN_H=90, ZMIN=.15, ZMAX=3;
+
+/* ---------- state ---------- */
+let surfaces=[], view={x:0,y:0,z:1}, topZ=1;
+const els=new Map();
+const viewEl=$('#view'), world=$('#world');
+
+function load(){
+  try{const d=JSON.parse(store.get(KEY)||'null');if(d){surfaces=Array.isArray(d.surfaces)?d.surfaces:[];if(d.view)view={x:+d.view.x||0,y:+d.view.y||0,z:clamp(+d.view.z||1,ZMIN,ZMAX)}}}catch{surfaces=[]}
+  topZ=surfaces.reduce((m,s)=>Math.max(m,s.z||0),0)+1;
+}
+let saveT=null;
+function saveNow(){clearTimeout(saveT);saveT=null;store.set(KEY,JSON.stringify({v:1,view,surfaces:surfaces.map(({fresh,...s})=>s)}))}
+function save(){clearTimeout(saveT);saveT=setTimeout(saveNow,250)}
+window.addEventListener('pagehide',saveNow);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)saveNow()});
+
+/* ---------- colour ---------- */
+function hex(c){const n=parseInt(c.slice(1),16);return[n>>16&255,n>>8&255,n&255]}
+function mix(a,b,t){const x=hex(a),y=hex(b);return'rgb('+x.map((v,i)=>Math.round(v+(y[i]-v)*t)).join(',')+')'}
+function cssVar(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim()}
+function paint(s){
+  const el=els.get(s.id);if(!el)return;
+  const raised=cssVar('--raised')||'#232a27', line=cssVar('--line')||'#2d3531', tint=parseFloat(cssVar('--tint'))||.16;
+  el.style.background=s.c?mix(raised,s.c,tint):'';
+  el.style.borderColor=s.c&&!el.contains(document.activeElement)?mix(line,s.c,.45):'';
+  el.querySelector('.swatch i').style.background=s.c||'transparent';
+}
+matchMedia('(prefers-color-scheme: light)').addEventListener?.('change',()=>surfaces.forEach(paint));
+
+/* ---------- surfaces ---------- */
+const GRIP='<svg viewBox="0 0 10 18" fill="currentColor"><circle cx="3" cy="3" r="1.2"/><circle cx="7" cy="3" r="1.2"/><circle cx="3" cy="9" r="1.2"/><circle cx="7" cy="9" r="1.2"/><circle cx="3" cy="15" r="1.2"/><circle cx="7" cy="15" r="1.2"/></svg>';
+const CROSS='<svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M3.5 3.5l7 7M10.5 3.5l-7 7"/></svg>';
+
+function build(s){
+  const el=document.createElement('div');
+  el.className='surface';el.dataset.id=s.id;
+  el.innerHTML='<textarea spellcheck="true" placeholder="Write here…" aria-label="Surface"></textarea>'
+    +'<div class="strip"><button class="del" title="Delete surface" aria-label="Delete surface">'+CROSS+'</button>'
+    +'<button class="swatch" title="Colour" aria-label="Colour"><i></i></button><div class="grip" title="Drag">'+GRIP+'</div></div>'
+    +'<div class="resize" title="Resize"></div>';
+  const ta=el.querySelector('textarea');
+  ta.value=s.t||'';
+  ta.addEventListener('input',()=>{s.t=ta.value;s.fresh=false;save()});
+  ta.addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();ta.blur()}});
+  ta.addEventListener('focus',()=>{raise(s);paint(s)});
+  ta.addEventListener('blur',()=>{
+    paint(s);
+    // A surface made by a stray double-click and left empty goes away again.
+    setTimeout(()=>{if(s.fresh&&!s.t&&document.activeElement!==ta)remove(s,false);else saveNow()},0);
+  });
+  el.querySelector('.del').addEventListener('click',e=>{
+    const b=e.currentTarget;
+    if(!s.t.trim()){remove(s,true);return}
+    if(b.classList.contains('confirm')){remove(s,true);return}
+    b.classList.add('confirm');b.title='Click again to delete';
+    setTimeout(()=>{b.classList.remove('confirm');b.title='Delete surface'},2500);
+  });
+  el.querySelector('.swatch').addEventListener('click',e=>{e.stopPropagation();openPalette(s,e.currentTarget)});
+  el.addEventListener('pointerdown',e=>onSurfaceDown(e,s,el));
+  world.appendChild(el);els.set(s.id,el);
+  place(s);paint(s);
+  return el;
+}
+function place(s){
+  const el=els.get(s.id);if(!el)return;
+  el.style.left=s.x+'px';el.style.top=s.y+'px';el.style.width=s.w+'px';el.style.height=s.h+'px';el.style.zIndex=s.z||1;
+}
+function raise(s){if((s.z||0)<topZ-1||!s.z){s.z=topZ++;place(s);save()}}
+function add(x,y,focus){
+  const s={id:nid(),x:Math.round(x),y:Math.round(y),w:300,h:200,c:'',t:'',z:topZ++,fresh:true};
+  // Don't stack exactly on top of another one.
+  while(surfaces.some(o=>Math.abs(o.x-s.x)<12&&Math.abs(o.y-s.y)<12)){s.x+=28;s.y+=28}
+  surfaces.push(s);build(s);hint();save();
+  if(focus)els.get(s.id).querySelector('textarea').focus({preventScroll:true});
+  return s;
+}
+let lastDeleted=null, toastT=null;
+function remove(s,offerUndo){
+  const i=surfaces.indexOf(s);if(i<0)return;
+  surfaces.splice(i,1);els.get(s.id)?.remove();els.delete(s.id);
+  closePalette();hint();saveNow();
+  if(offerUndo){
+    lastDeleted={s,i};$('#toast').classList.add('open');
+    clearTimeout(toastT);toastT=setTimeout(()=>{$('#toast').classList.remove('open');lastDeleted=null},7000);
+  }
+}
+$('#undoDel').onclick=()=>{
+  if(!lastDeleted)return;
+  const{s,i}=lastDeleted;lastDeleted=null;$('#toast').classList.remove('open');
+  surfaces.splice(Math.min(i,surfaces.length),0,s);build(s);hint();saveNow();
+};
+function hint(){$('#hint').style.display=surfaces.length?'none':''}
+
+/* ---------- dragging and resizing ---------- */
+function onSurfaceDown(e,s,el){
+  if(e.button!==0)return;
+  const t=e.target;
+  if(t.tagName==='TEXTAREA'){raise(s);return}
+  s.fresh=false;                      // moved, coloured or resized: keep it even while empty
+  if(t.closest('button')){raise(s);return}
+  e.preventDefault();e.stopPropagation();
+  raise(s);
+  const resizing=t.classList.contains('resize');
+  const start={x:e.clientX,y:e.clientY,sx:s.x,sy:s.y,sw:s.w,sh:s.h};
+  el.setPointerCapture(e.pointerId);
+  if(!resizing)el.classList.add('dragging');
+  const move=ev=>{
+    const dx=(ev.clientX-start.x)/view.z, dy=(ev.clientY-start.y)/view.z;
+    if(resizing){s.w=Math.round(Math.max(MIN_W,start.sw+dx));s.h=Math.round(Math.max(MIN_H,start.sh+dy))}
+    else{s.x=Math.round(start.sx+dx);s.y=Math.round(start.sy+dy)}
+    s.fresh=false;place(s);
+  };
+  const up=()=>{
+    el.releasePointerCapture?.(e.pointerId);
+    el.classList.remove('dragging');
+    el.removeEventListener('pointermove',move);el.removeEventListener('pointerup',up);el.removeEventListener('pointercancel',up);
+    save();
+  };
+  el.addEventListener('pointermove',move);el.addEventListener('pointerup',up);el.addEventListener('pointercancel',up);
+}
+
+/* ---------- colour picker ---------- */
+const pal=$('#palette');let palFor=null;
+function openPalette(s,anchor){
+  if(palFor===s){closePalette();return}
+  palFor=s;pal.innerHTML='';
+  const opt=(c)=>{const b=document.createElement('button');b.title=c?c:'Plain';b.setAttribute('aria-label',c?'Colour '+c:'Plain');
+    if(c)b.style.background=c;else b.className='none';if((s.c||'')===c)b.classList.add('on');
+    b.onclick=ev=>{ev.stopPropagation();s.c=c;s.fresh=false;paint(s);save();closePalette()};pal.appendChild(b)};
+  opt('');COLORS.forEach(opt);
+  pal.classList.add('open');
+  const r=anchor.getBoundingClientRect(), pw=pal.offsetWidth, ph=pal.offsetHeight;
+  pal.style.left=clamp(r.right+8,8,innerWidth-pw-8)+'px';
+  pal.style.top=clamp(r.top-8,8,innerHeight-ph-8)+'px';
+}
+function closePalette(){palFor=null;pal.classList.remove('open')}
+document.addEventListener('pointerdown',e=>{if(!pal.contains(e.target)&&!e.target.closest('.swatch'))closePalette()},true);
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closePalette()});
+
+/* ---------- pan and zoom ---------- */
+function applyView(){
+  world.style.transform='translate('+view.x+'px,'+view.y+'px) scale('+view.z+')';
+  const g=24*view.z;
+  viewEl.style.backgroundSize=g+'px '+g+'px';
+  viewEl.style.backgroundPosition=view.x+'px '+view.y+'px';
+  $('#zoom').textContent=Math.round(view.z*100)+'%';
+}
+function zoomAt(z,cx,cy){
+  z=clamp(z,ZMIN,ZMAX);
+  view.x=cx-(cx-view.x)*z/view.z;view.y=cy-(cy-view.y)*z/view.z;view.z=z;
+  applyView();save();
+}
+const center=()=>[innerWidth/2,innerHeight/2];
+function toWorld(cx,cy){return[(cx-view.x)/view.z,(cy-view.y)/view.z]}
+function fit(){
+  if(!surfaces.length){view={x:innerWidth/2,y:innerHeight/2,z:1};applyView();save();return}
+  const x0=Math.min(...surfaces.map(s=>s.x)),y0=Math.min(...surfaces.map(s=>s.y));
+  const x1=Math.max(...surfaces.map(s=>s.x+s.w)),y1=Math.max(...surfaces.map(s=>s.y+s.h));
+  const pad=60, z=clamp(Math.min((innerWidth-2*pad)/(x1-x0),(innerHeight-2*pad-50)/(y1-y0),1),ZMIN,ZMAX);
+  view={z,x:(innerWidth-(x1-x0)*z)/2-x0*z,y:(innerHeight-50-(y1-y0)*z)/2-y0*z};
+  applyView();save();
+}
+
+// Drag empty space to pan.
+viewEl.addEventListener('pointerdown',e=>{
+  if(e.button!==0||e.target.closest('.surface'))return;
+  document.activeElement?.blur?.();
+  const start={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y};
+  viewEl.setPointerCapture(e.pointerId);viewEl.classList.add('panning');
+  const move=ev=>{view.x=start.vx+ev.clientX-start.x;view.y=start.vy+ev.clientY-start.y;applyView()};
+  const up=()=>{viewEl.classList.remove('panning');viewEl.removeEventListener('pointermove',move);viewEl.removeEventListener('pointerup',up);viewEl.removeEventListener('pointercancel',up);save()};
+  viewEl.addEventListener('pointermove',move);viewEl.addEventListener('pointerup',up);viewEl.addEventListener('pointercancel',up);
+});
+// Double-click empty space for a new surface there.
+viewEl.addEventListener('dblclick',e=>{
+  if(e.target.closest('.surface'))return;
+  const[x,y]=toWorld(e.clientX,e.clientY);add(x-150,y-24,true);
+});
+// Scroll pans (a surface's own text scrolls first); pinch or ⌘/ctrl-scroll zooms.
+function canScroll(el,dx,dy){
+  const ta=el&&el.closest&&el.closest('textarea');if(!ta)return false;
+  if(dy&&ta.scrollHeight>ta.clientHeight){if(dy<0?ta.scrollTop>0:ta.scrollTop+ta.clientHeight<ta.scrollHeight-1)return true}
+  if(dx&&ta.scrollWidth>ta.clientWidth){if(dx<0?ta.scrollLeft>0:ta.scrollLeft+ta.clientWidth<ta.scrollWidth-1)return true}
+  return false;
+}
+viewEl.addEventListener('wheel',e=>{
+  if(e.ctrlKey||e.metaKey){e.preventDefault();zoomAt(view.z*Math.exp(-e.deltaY*(e.ctrlKey?.012:.004)),e.clientX,e.clientY);return}
+  if(canScroll(e.target,e.deltaX,e.deltaY))return;
+  e.preventDefault();view.x-=e.deltaX;view.y-=e.deltaY;applyView();save();
+},{passive:false});
+// Safari's trackpad pinch.
+let g0=null;
+viewEl.addEventListener('gesturestart',e=>{e.preventDefault();g0=view.z});
+viewEl.addEventListener('gesturechange',e=>{e.preventDefault();if(g0!=null)zoomAt(g0*e.scale,e.clientX,e.clientY)});
+viewEl.addEventListener('gestureend',e=>{e.preventDefault();g0=null});
+
+$('#new').onclick=()=>{const[cx,cy]=center();const[x,y]=toWorld(cx,cy);add(x-150,y-100,true)};
+$('#in').onclick=()=>zoomAt(view.z*1.25,...center());
+$('#out').onclick=()=>zoomAt(view.z/1.25,...center());
+$('#zoom').onclick=()=>zoomAt(1,...center());
+$('#fit').onclick=fit;
+document.querySelectorAll('#tools button').forEach(b=>b.addEventListener('mousedown',e=>e.preventDefault()));
+
+// Keys when nothing is being written: ⌘0 shows everything, ⌘+ / ⌘− zoom.
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='TEXTAREA')return;
+  const mod=e.metaKey||e.ctrlKey;
+  if(mod&&e.key==='0'){e.preventDefault();fit()}
+  else if(mod&&(e.key==='='||e.key==='+')){e.preventDefault();$('#in').click()}
+  else if(mod&&e.key==='-'){e.preventDefault();$('#out').click()}
+});
+
+/* ---------- boot ---------- */
+load();
+if(!store.get(KEY))view={x:innerWidth/2,y:innerHeight/2,z:1};
+surfaces.forEach(build);hint();applyView();
+if(document.fonts&&document.fonts.ready)document.fonts.ready.then(()=>surfaces.forEach(paint));
+</script>
+</body>
+</html>

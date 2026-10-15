@@ -1,5 +1,5 @@
+import AVFoundation
 import Cocoa
-import UserNotifications
 import WebKit
 
 // MARK: - Model
@@ -34,6 +34,13 @@ enum Config {
 
     static var muted: Bool { UserDefaults.standard.bool(forKey: "mute") }
 
+    /// How much louder than the system plays them the sounds are, in dB (0...24, default 18).
+    /// A peak limiter after the boost keeps it from clipping.
+    static var soundBoost: Float {
+        guard UserDefaults.standard.object(forKey: "soundBoost") != nil else { return 18 }
+        return min(max(UserDefaults.standard.float(forKey: "soundBoost"), 0), 24)
+    }
+
     static func seconds(minutes: Int) -> TimeInterval { Double(minutes) * secondsPerMinute }
 
     /// `mm:ss` of a real interval, in the app's minutes, rounded up so a full minute reads 01:00.
@@ -59,12 +66,13 @@ enum Config {
     static let usage = """
     CountdownOverlay — the Opened / Closed session timer from Specification.md.
 
-    usage: CountdownOverlay [-minute SECONDS] [-mute YES]
+    usage: CountdownOverlay [-minute SECONDS] [-mute YES] [-soundBoost DB]
 
-      -minute N     real seconds per app minute, 1...60 (default 60), to try the cycle quickly
-      -mute YES     no sounds at transitions
-      -h, --help    show this help
-      --version     print the version and commit this copy was built from
+      -minute N       real seconds per app minute, 1...60 (default 60), to try the cycle quickly
+      -mute YES       no sounds at transitions
+      -soundBoost N   how much louder than the system the sounds play, 0...24 dB (default 18)
+      -h, --help      show this help
+      --version       print the version and commit this copy was built from
     """
 }
 
@@ -79,12 +87,108 @@ enum Sound: String {
     case pauseOver = "Blow"           // the pause is over: back to a confirmation
     case sessionOver = "Funk"         // the session has ended
 
+    /// Times it plays in a row: the shortest ones are over before you notice them otherwise.
+    var times: Int {
+        switch self {
+        case .reminder, .escaped: return 3
+        default: return 1
+        }
+    }
+
     func play() {
         guard !Config.muted else { return }
-        // `NSSound(named:)` hands back a shared instance that ignores play() while it is already
-        // playing; a copy plays every time.
-        guard let sound = NSSound(named: NSSound.Name(rawValue))?.copy() as? NSSound else { return }
-        sound.play()
+        SoundPlayer.shared.play(rawValue, times: times)
+    }
+}
+
+/// Plays the system sounds louder than NSSound can (its volume tops out at what the system plays):
+/// player → gain → peak limiter → output, so the boost raises the loudness without clipping. The
+/// engine only runs while something is playing. Without an output device it falls back to NSSound.
+final class SoundPlayer {
+    static let shared = SoundPlayer()
+
+    private let engine = AVAudioEngine()
+    private let bus = AVAudioMixerNode()             // takes each sound in its own format
+    private let gain = AVAudioUnitEQ(numberOfBands: 0)
+    private let limiter = AVAudioUnitEffect(audioComponentDescription: AudioComponentDescription(
+        componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_PeakLimiter,
+        componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0))
+    private var buffers: [String: AVAudioPCMBuffer] = [:]
+    private var playing = 0
+    private var stopWork: DispatchWorkItem?
+
+    private init() {
+        gain.globalGain = Config.soundBoost
+        for node in [bus, gain, limiter] as [AVAudioNode] { engine.attach(node) }
+        engine.connect(bus, to: gain, format: nil)
+        engine.connect(gain, to: limiter, format: nil)
+        engine.connect(limiter, to: engine.mainMixerNode, format: nil)
+    }
+
+    func play(_ name: String, times: Int) {
+        guard let buffer = buffer(named: name), start() else {
+            // `NSSound(named:)` hands back a shared instance that ignores play() while it is
+            // already playing; a copy plays every time.
+            (NSSound(named: NSSound.Name(name))?.copy() as? NSSound)?.play()
+            return
+        }
+        let player = AVAudioPlayerNode()
+        engine.attach(player)
+        engine.connect(player, to: bus, format: buffer.format)
+        // Repeats follow each other with a short gap, on the player's own clock.
+        let rate = buffer.format.sampleRate
+        let step = Double(buffer.frameLength) / rate + 0.09
+        for i in 0..<max(times, 1) {
+            let at = AVAudioTime(sampleTime: AVAudioFramePosition(Double(i) * step * rate), atRate: rate)
+            let last = i == max(times, 1) - 1
+            player.scheduleBuffer(buffer, at: at, options: [], completionCallbackType: .dataPlayedBack) { _ in
+                guard last else { return }
+                DispatchQueue.main.async { self.finished(player) }
+            }
+        }
+        playing += 1
+        stopWork?.cancel()
+        player.play()
+    }
+
+    private func finished(_ player: AVAudioPlayerNode) {
+        player.stop()
+        engine.detach(player)
+        playing -= 1
+        guard playing == 0 else { return }
+        // Let go of the audio hardware once it's been quiet for a moment.
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.playing == 0 else { return }
+            self.engine.stop()
+        }
+        stopWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+    }
+
+    private func start() -> Bool {
+        if engine.isRunning { return true }
+        engine.prepare()
+        do {
+            try engine.start()
+            return true
+        } catch {
+            NSLog("sound: couldn't start the audio engine: %@", error.localizedDescription)
+            return false
+        }
+    }
+
+    private func buffer(named name: String) -> AVAudioPCMBuffer? {
+        if let buffer = buffers[name] { return buffer }
+        let fm = FileManager.default
+        let dirs = ["/System/Library/Sounds", "/Library/Sounds",
+                    fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Sounds").path]
+        guard let path = dirs.map({ "\($0)/\(name).aiff" }).first(where: fm.fileExists(atPath:)),
+              let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)),
+              let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                            frameCapacity: AVAudioFrameCount(file.length)),
+              (try? file.read(into: buffer)) != nil else { return nil }
+        buffers[name] = buffer
+        return buffer
     }
 }
 
@@ -137,42 +241,125 @@ enum Store {
     }
 }
 
-/// Notifications for Opened-mode reminders (§5) and other things that happen while the screen
-/// isn't blocked. Only an app bundle can post them; a bare binary logs instead.
-enum Notifier {
-    static var available: Bool { Updater.isInstalledApp }
+// MARK: - Pop-up (reminders, Specification §5)
 
-    static func requestPermission() {
-        guard available else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert]) { _, _ in }
+/// Reminders and the other things worth knowing mid-session, in the middle of every screen and
+/// above everything, the blocked screen included. It never takes focus, so typing carries on;
+/// it goes away by itself after a few seconds, or at a click.
+final class Popup {
+    static let shared = Popup()
+    private var panels: [PopupPanel] = []
+    private var hideWork: DispatchWorkItem?
+
+    func show(_ headline: String, _ detail: String, for seconds: TimeInterval = 6) {
+        hideWork?.cancel()
+        panels.forEach { $0.close() }
+        panels = NSScreen.screens.map { screen in
+            let panel = PopupPanel(screen: screen, headline: headline, detail: detail) { [weak self] in
+                self?.hide()
+            }
+            panel.alphaValue = 0
+            panel.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.15
+                panel.animator().alphaValue = 1
+            }
+            return panel
+        }
+        let work = DispatchWorkItem { [weak self] in self?.hide() }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
     }
 
-    static func post(_ title: String, _ body: String) {
-        guard available else {
-            NSLog("%@: %@", title, body)
-            return
-        }
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+    func hide() {
+        hideWork?.cancel()
+        hideWork = nil
+        let leaving = panels
+        panels = []
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.4
+            leaving.forEach { $0.animator().alphaValue = 0 }
+        }, completionHandler: {
+            leaving.forEach { $0.close() }
+        })
     }
 }
 
-// MARK: - Mind map (what Closed shows on the main screen, Specification §10)
+final class PopupPanel: NSPanel {
+    /// The panel's content: hands a click to the panel, even the first one on an inactive app.
+    private final class ClickView: NSView {
+        var onClick: (() -> Void)?
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+        override func mouseDown(with event: NSEvent) { onClick?() }
+    }
 
-/// Mind Maps.html in a web view that lives as long as the app, so a map and its undo history
-/// survive from one Closed to the next. The page keeps its maps through `store`, which here posts
-/// them to the app; they're saved in ~/Library/Application Support/CountdownOverlay/mindmaps.json.
-final class MindMap: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    init(screen: NSScreen, headline: String, detail: String, onClick: @escaping () -> Void) {
+        let shortSide = min(screen.frame.width, screen.frame.height)
+        let size = NSSize(width: min(max(shortSide * 0.6, 380), 620), height: min(max(shortSide * 0.3, 200), 300))
+        let frame = NSRect(x: screen.frame.midX - size.width / 2, y: screen.frame.midY - size.height / 2,
+                           width: size.width, height: size.height)
+        super.init(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
+                   backing: .buffered, defer: false)
+        setFrame(frame, display: false)
+        level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)  // above the overlay
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        hidesOnDeactivate = false
+        isReleasedWhenClosed = false
+        isExcludedFromWindowsMenu = true
+        animationBehavior = .none
+
+        let content = ClickView(frame: NSRect(origin: .zero, size: size))
+        content.onClick = onClick
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.94).cgColor
+        content.layer?.cornerRadius = 28
+        content.layer?.borderWidth = 1
+        content.layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
+
+        let big = NSTextField(labelWithString: headline)
+        big.font = NSFont.monospacedDigitSystemFont(ofSize: size.height * 0.34, weight: .bold)
+        big.textColor = .white
+        big.alignment = .center
+        let small = NSTextField(wrappingLabelWithString: detail)
+        small.font = NSFont.systemFont(ofSize: size.height * 0.11, weight: .medium)
+        small.textColor = NSColor.white.withAlphaComponent(0.8)
+        small.alignment = .center
+        let stack = NSStackView(views: [big, small])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = size.height * 0.05
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            stack.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, multiplier: 0.88),
+        ])
+        contentView = content
+        setAccessibilityLabel("\(headline). \(detail)")
+    }
+
+    // Never takes focus: whatever you're typing in keeps the keys.
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+// MARK: - Canvas (what Closed shows on the main screen, Specification §10)
+
+/// Canvas.html in a web view that lives as long as the app, so the surfaces and their undo history
+/// survive from one Closed to the next. The page keeps its surfaces through `store`, which here
+/// posts them to the app; they're saved in ~/Library/Application Support/CountdownOverlay/canvas.json.
+final class Canvas: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     let webView: WKWebView
     private let page: URL
     private var saved: [String: String]
 
     static var fileURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/CountdownOverlay/mindmaps.json")
+            .appendingPathComponent("Library/Application Support/CountdownOverlay/canvas.json")
     }
 
     /// make-app.sh copies the page into the bundle; a bare binary looks beside itself and in the
@@ -180,16 +367,15 @@ final class MindMap: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     static var pageURL: URL? {
         let fm = FileManager.default
         let candidates = [
-            Bundle.main.url(forResource: "MindMap", withExtension: "html"),
-            Bundle.main.bundleURL.appendingPathComponent("Mind Maps.html"),
-            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("Mind Maps.html"),
-            URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("Mind Maps.html"),
+            Bundle.main.url(forResource: "Canvas", withExtension: "html"),
+            Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("Canvas.html"),
+            URL(fileURLWithPath: fm.currentDirectoryPath).appendingPathComponent("Canvas.html"),
         ]
         return candidates.compactMap { $0 }.first { fm.fileExists(atPath: $0.path) }
     }
 
     /// nil when the page can't be found: Closed then shows the plain dark screen.
-    init?(page: URL? = MindMap.pageURL) {
+    init?(page: URL? = Canvas.pageURL) {
         guard let page = page else { return nil }
         self.page = page
         saved = (try? Data(contentsOf: Self.fileURL))
@@ -197,7 +383,7 @@ final class MindMap: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let config = WKWebViewConfiguration()
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
-        config.userContentController.add(self, name: "mindmap")
+        config.userContentController.add(self, name: "canvas")
         webView.navigationDelegate = self
         load()
     }
@@ -206,9 +392,9 @@ final class MindMap: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let controller = webView.configuration.userContentController
         controller.removeAllUserScripts()
         let data = (try? JSONSerialization.data(withJSONObject: saved)) ?? Data("{}".utf8)
-        // The saved maps, before the page's own script reads them. No context menu: its Look Up
+        // The saved surfaces, before the page's own script reads them. No context menu: its Look Up
         // and Search items would open other apps behind the overlay.
-        let source = "window.mindmapSaved = \(String(decoding: data, as: UTF8.self));"
+        let source = "window.canvasSaved = \(String(decoding: data, as: UTF8.self));"
             + "document.addEventListener('contextmenu', e => e.preventDefault());"
         controller.addUserScript(WKUserScript(source: source, injectionTime: .atDocumentStart,
                                               forMainFrameOnly: true))
@@ -231,7 +417,7 @@ final class MindMap: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
                                                     withIntermediateDirectories: true)
             try JSONSerialization.data(withJSONObject: saved).write(to: url, options: .atomic)
         } catch {
-            NSLog("mind map: couldn't save %@: %@", url.path, error.localizedDescription)
+            NSLog("canvas: couldn't save %@: %@", url.path, error.localizedDescription)
         }
     }
 
@@ -245,30 +431,30 @@ final class MindMap: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     }
 }
 
-/// The mind map as an ordinary window, opened from its menu-bar icon while the screen isn't
-/// blocked (§10). Closing it only hides it: the map lives on in the shared web view, which moves
-/// into the overlay whenever the screen is blocked.
-final class MindMapWindow: NSWindow, NSWindowDelegate {
-    private let mindMap: MindMap
+/// The canvas as an ordinary window, opened from its menu-bar icon while the screen isn't
+/// blocked (§10). Closing it only hides it: the canvas lives on in the shared web view, which
+/// moves into the overlay whenever the screen is blocked.
+final class CanvasWindow: NSWindow, NSWindowDelegate {
+    private let canvas: Canvas
 
-    init(mindMap: MindMap) {
-        self.mindMap = mindMap
+    init(canvas: Canvas) {
+        self.canvas = canvas
         super.init(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 680),
                    styleMask: [.titled, .closable, .miniaturizable, .resizable],
                    backing: .buffered,
                    defer: false)
-        title = "Mind Maps"
+        title = "Canvas"
         isReleasedWhenClosed = false
         minSize = NSSize(width: 480, height: 360)
         contentView = NSView()
         delegate = self
         center()
-        setFrameAutosaveName("MindMapWindow")       // reopens where it was last left
+        setFrameAutosaveName("CanvasWindow")       // reopens where it was last left
     }
 
     /// Takes the web view back (from the overlay, or wherever it was).
     func attach() {
-        let web = mindMap.webView
+        let web = canvas.webView
         guard let content = contentView, web.superview !== content else { return }
         web.removeFromSuperview()
         web.translatesAutoresizingMaskIntoConstraints = false
@@ -281,7 +467,7 @@ final class MindMapWindow: NSWindow, NSWindowDelegate {
         ])
     }
 
-    func windowWillClose(_ notification: Notification) { mindMap.commitEdits() }
+    func windowWillClose(_ notification: Notification) { canvas.commitEdits() }
 }
 
 // MARK: - Overlay window (one per screen)
@@ -319,14 +505,14 @@ final class OverlayWindow: NSWindow {
     private let headingSize: CGFloat
     private let textSize: CGFloat
 
-    // Closed on the main screen (§10): the mind map fills it, under a strip with the clock, the
+    // Closed on the main screen (§10): the canvas fills it, under a strip with the clock, the
     // status line and I need out.
-    private(set) var mindMap: WKWebView?
-    private let mapPane = NSView()
-    private let mapBar = NSStackView()
-    private let mapClock = NSTextField(labelWithString: "")
-    private let mapStatus = NSTextField(labelWithString: "")
-    private let mapEscape = NSButton(title: "I need out", target: nil, action: nil)
+    private(set) var canvas: WKWebView?
+    private let canvasPane = NSView()
+    private let canvasBar = NSStackView()
+    private let canvasClock = NSTextField(labelWithString: "")
+    private let canvasStatus = NSTextField(labelWithString: "")
+    private let canvasEscape = NSButton(title: "I need out", target: nil, action: nil)
 
     init(screen: NSScreen) {
         // Use the global-coordinate initializer: the `screen:` variant interprets
@@ -378,38 +564,39 @@ final class OverlayWindow: NSWindow {
             stack.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, multiplier: 0.8),
         ])
 
-        mapClock.font = NSFont.monospacedDigitSystemFont(ofSize: textSize * 1.3, weight: .bold)
-        mapClock.textColor = .white
-        mapClock.setAccessibilityLabel("Time left")
-        mapStatus.font = NSFont.systemFont(ofSize: textSize * 0.8, weight: .medium)
-        mapStatus.textColor = NSColor.white.withAlphaComponent(0.85)
-        mapStatus.lineBreakMode = .byTruncatingTail
-        mapStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        mapEscape.target = self
-        mapEscape.action = #selector(escapePressed)
-        mapEscape.bezelStyle = .rounded
-        mapEscape.font = NSFont.systemFont(ofSize: textSize * 0.8)
+        canvasClock.font = NSFont.monospacedDigitSystemFont(ofSize: textSize * 1.3, weight: .bold)
+        canvasClock.textColor = .white
+        canvasClock.setAccessibilityLabel("Time left")
+        canvasStatus.font = NSFont.systemFont(ofSize: textSize * 0.8, weight: .medium)
+        canvasStatus.textColor = NSColor.white.withAlphaComponent(0.85)
+        canvasStatus.lineBreakMode = .byTruncatingTail
+        canvasStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        canvasEscape.target = self
+        canvasEscape.action = #selector(escapePressed)
+        canvasEscape.bezelStyle = .rounded
+        canvasEscape.font = NSFont.systemFont(ofSize: textSize * 0.8)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        for view in [mapClock, mapStatus, spacer, mapEscape] as [NSView] { mapBar.addArrangedSubview(view) }
-        mapBar.orientation = .horizontal
-        mapBar.spacing = textSize
-        mapBar.edgeInsets = NSEdgeInsets(top: 8, left: textSize, bottom: 8, right: textSize)
-        mapBar.translatesAutoresizingMaskIntoConstraints = false
-        mapPane.wantsLayer = true
-        mapPane.layer?.backgroundColor = NSColor.black.cgColor
-        mapPane.translatesAutoresizingMaskIntoConstraints = false
-        mapPane.isHidden = true
-        mapPane.addSubview(mapBar)
-        content.addSubview(mapPane)
+        for view in [canvasClock, canvasStatus, spacer, canvasEscape] as [NSView] { canvasBar.addArrangedSubview(view) }
+        canvasBar.orientation = .horizontal
+        canvasBar.spacing = textSize
+        canvasBar.edgeInsets = NSEdgeInsets(top: 8, left: textSize, bottom: 8, right: textSize)
+        canvasBar.translatesAutoresizingMaskIntoConstraints = false
+        canvasPane.wantsLayer = true
+        // The canvas page's own ground colour, so the strip runs into it.
+        canvasPane.layer?.backgroundColor = NSColor(srgbRed: 0.078, green: 0.098, blue: 0.09, alpha: 1).cgColor
+        canvasPane.translatesAutoresizingMaskIntoConstraints = false
+        canvasPane.isHidden = true
+        canvasPane.addSubview(canvasBar)
+        content.addSubview(canvasPane)
         NSLayoutConstraint.activate([
-            mapPane.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            mapPane.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            mapPane.topAnchor.constraint(equalTo: content.topAnchor),
-            mapPane.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            mapBar.leadingAnchor.constraint(equalTo: mapPane.leadingAnchor),
-            mapBar.trailingAnchor.constraint(equalTo: mapPane.trailingAnchor),
-            mapBar.topAnchor.constraint(equalTo: mapPane.topAnchor, constant: topInset(of: screen)),
+            canvasPane.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            canvasPane.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            canvasPane.topAnchor.constraint(equalTo: content.topAnchor),
+            canvasPane.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            canvasBar.leadingAnchor.constraint(equalTo: canvasPane.leadingAnchor),
+            canvasBar.trailingAnchor.constraint(equalTo: canvasPane.trailingAnchor),
+            canvasBar.topAnchor.constraint(equalTo: canvasPane.topAnchor, constant: topInset(of: screen)),
         ])
         contentView = content
     }
@@ -420,18 +607,18 @@ final class OverlayWindow: NSWindow {
         return 0
     }
 
-    /// Hosts the mind map here (moving it from wherever it was), for Closed to show.
-    func attachMindMap(_ webView: WKWebView) {
+    /// Hosts the canvas here (moving it from wherever it was), for Closed to show.
+    func attachCanvas(_ webView: WKWebView) {
         webView.removeFromSuperview()
         webView.translatesAutoresizingMaskIntoConstraints = false
-        mapPane.addSubview(webView)
+        canvasPane.addSubview(webView)
         NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: mapBar.bottomAnchor),
-            webView.leadingAnchor.constraint(equalTo: mapPane.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: mapPane.trailingAnchor),
-            webView.bottomAnchor.constraint(equalTo: mapPane.bottomAnchor),
+            webView.topAnchor.constraint(equalTo: canvasBar.bottomAnchor),
+            webView.leadingAnchor.constraint(equalTo: canvasPane.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: canvasPane.trailingAnchor),
+            webView.bottomAnchor.constraint(equalTo: canvasPane.bottomAnchor),
         ])
-        mindMap = webView
+        canvas = webView
     }
 
     // MARK: Content
@@ -443,19 +630,19 @@ final class OverlayWindow: NSWindow {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         answerField = nil
 
-        // Closed with the mind map here: it replaces the dark screen; everything else covers it.
-        if case let .closed(escape) = new, let map = mindMap {
-            mapEscape.isHidden = escape == .hidden
-            mapEscape.isEnabled = escape == .available
+        // Closed with the canvas here: it replaces the dark screen; everything else covers it.
+        if case let .closed(escape) = new, let web = canvas {
+            canvasEscape.isHidden = escape == .hidden
+            canvasEscape.isEnabled = escape == .available
             stack.isHidden = true
-            mapPane.isHidden = false
-            makeFirstResponder(map)
+            canvasPane.isHidden = false
+            makeFirstResponder(web)
             return
         }
-        mapPane.isHidden = true
+        canvasPane.isHidden = true
         stack.isHidden = false
-        // Keys mustn't keep going to the hidden map (a confirmation or the puzzle covers it).
-        if let map = mindMap, let responder = firstResponder as? NSView, responder.isDescendant(of: map) {
+        // Keys mustn't keep going to the hidden canvas (a confirmation or the puzzle covers it).
+        if let web = canvas, let responder = firstResponder as? NSView, responder.isDescendant(of: web) {
             makeFirstResponder(nil)
         }
 
@@ -508,12 +695,12 @@ final class OverlayWindow: NSWindow {
 
     func setClock(_ text: String) {
         if clockLabel.stringValue != text { clockLabel.stringValue = text }
-        if mapClock.stringValue != text { mapClock.stringValue = text }
+        if canvasClock.stringValue != text { canvasClock.stringValue = text }
     }
 
     func setStatus(_ text: String) {
         if statusLabel.stringValue != text { statusLabel.stringValue = text }
-        if mapStatus.stringValue != text { mapStatus.stringValue = text }
+        if canvasStatus.stringValue != text { canvasStatus.stringValue = text }
     }
 
     /// Puts the cursor in the answer field, when the puzzle is showing.
@@ -560,7 +747,7 @@ final class OverlayWindow: NSWindow {
     override func cancelOperation(_ sender: Any?) {}
     override func performClose(_ sender: Any?) {}  // Cmd-W from the main menu: not here
 
-    /// Return still reaches the Start / Answer buttons and the mind map gets its shortcuts; the
+    /// Return still reaches the Start / Answer buttons and the canvas gets its shortcuts; the
     /// Edit menu (cut, copy, paste, select all) comes next; any other Cmd-combination
     /// (Cmd-W, Cmd-Q, Cmd-H…) stops here.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -961,8 +1148,7 @@ final class Updater {
 
 // MARK: - App delegate
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, OverlayActions,
-                         UNUserNotificationCenterDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, OverlayActions {
     /// Where the session is (§1, §3, §7). Everything else derives from it.
     enum Phase {
         case idle
@@ -979,10 +1165,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     private var rebuildWork: DispatchWorkItem?
     private var previousApp: NSRunningApplication?
     private let updater = Updater()
-    private var mindMap: MindMap?                  // nil when Mind Maps.html isn't there
-    private var mapItem: NSStatusItem?             // the mind map's own menu-bar icon
-    private var mapWindow: MindMapWindow?
-    private var mapWindowWasOpen = false           // reopen it when the screen unblocks
+    private var canvas: Canvas?                    // nil when Canvas.html isn't there
+    private var canvasItem: NSStatusItem?          // the canvas's own menu-bar icon
+    private var canvasWindow: CanvasWindow?
+    private var canvasWindowWasOpen = false        // reopen it when the screen unblocks
 
     private var phase: Phase = .idle
     private var sessionEnd: Date?
@@ -1020,12 +1206,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         updateStatusItem()
         installMainMenu()
         // Loaded now, so it's ready the first time Closed shows it.
-        mindMap = MindMap()
-        if mindMap != nil { addMapStatusItem() }
-
-        if Notifier.available {
-            UNUserNotificationCenter.current().delegate = self
-        }
+        canvas = Canvas()
+        if canvas != nil { addCanvasStatusItem() }
 
         updater.onChange = { [weak self] _ in self?.updateStatusItem() }
         updater.start()
@@ -1079,16 +1261,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
-    // Show reminders even while this app is the active one.
-    func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                willPresent notification: UNNotification,
-                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        completionHandler([.banner, .list])
-    }
-
-    /// Never shown (the app has no menu bar of its own), but it's what makes Cmd-W close the mind
-    /// map's window and Cmd-X / C / V / A work in the mind map and the puzzle's answer field.
-    /// Deliberately no Quit; the overlay ignores Close.
+    /// Never shown (the app has no menu bar of its own), but it's what makes Cmd-W close the
+    /// canvas's window and Cmd-Z / X / C / V / A work on the canvas and in the puzzle's answer
+    /// field. Deliberately no Quit; the overlay ignores Close.
     private func installMainMenu() {
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
@@ -1096,6 +1271,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         windowItem.submenu = windowMenu
 
         let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
         edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
@@ -1108,48 +1285,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         NSApp.mainMenu = main
     }
 
-    // MARK: Mind map window (§10)
+    // MARK: Canvas window (§10)
 
-    private func addMapStatusItem() {
+    private func addCanvasStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
-            if let image = NSImage(systemSymbolName: "brain", accessibilityDescription: "Mind map") {
+            if let image = NSImage(systemSymbolName: "square.and.pencil", accessibilityDescription: "Canvas") {
                 image.isTemplate = true
                 button.image = image
             } else {
                 button.title = "✦"                 // fallback if SF Symbols are unavailable
             }
-            button.toolTip = "Mind map"
+            button.toolTip = "Canvas"
             button.target = self
-            button.action = #selector(toggleMindMap)
+            button.action = #selector(toggleCanvas)
         }
-        mapItem = item
+        canvasItem = item
     }
 
-    /// Opens the mind map's window, or closes it when it's already in front. While the screen is
-    /// blocked the overlay shows the map instead, and nothing closes it.
-    @objc private func toggleMindMap() {
-        guard !isBlocked, let map = mindMap else { return }
-        if let window = mapWindow, window.isVisible, window.isKeyWindow, NSApp.isActive {
+    /// Opens the canvas's window, or closes it when it's already in front. While the screen is
+    /// blocked the overlay shows the canvas instead, and nothing closes it.
+    @objc private func toggleCanvas() {
+        guard !isBlocked, let canvas = canvas else { return }
+        if let window = canvasWindow, window.isVisible, window.isKeyWindow, NSApp.isActive {
             window.performClose(nil)
             return
         }
-        showMapWindow(map)
+        showCanvasWindow(canvas)
     }
 
-    @objc private func openMindMap() {
-        guard !isBlocked, let map = mindMap else { return }
-        showMapWindow(map)
+    @objc private func openCanvas() {
+        guard !isBlocked, let canvas = canvas else { return }
+        showCanvasWindow(canvas)
     }
 
-    private func showMapWindow(_ map: MindMap) {
-        let window = mapWindow ?? MindMapWindow(mindMap: map)
-        mapWindow = window
+    private func showCanvasWindow(_ canvas: Canvas) {
+        let window = canvasWindow ?? CanvasWindow(canvas: canvas)
+        canvasWindow = window
         window.attach()
         if window.isMiniaturized { window.deminiaturize(nil) }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(map.webView)
+        window.makeFirstResponder(canvas.webView)
     }
 
     // MARK: Menubar
@@ -1208,9 +1385,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         menu.addItem(.separator())
         addUpdateItems(to: menu)
 
-        if mindMap != nil {
+        if canvas != nil {
             menu.addItem(.separator())
-            let open = menu.addItem(withTitle: "Open Mind Map", action: #selector(openMindMap), keyEquivalent: "")
+            let open = menu.addItem(withTitle: "Open Canvas", action: #selector(openCanvas), keyEquivalent: "")
             open.target = self
             open.isEnabled = !isBlocked
         }
@@ -1279,7 +1456,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     @objc private func startSession(_ sender: NSMenuItem) {
         guard !inSession, !updater.isInstalling, Config.sessionHours.contains(sender.tag) else { return }
-        Notifier.requestPermission()
         sessionEnd = Date().addingTimeInterval(Config.seconds(minutes: sender.tag * 60))
         Store.sessionEnd = sessionEnd
         firstConfirmation = true
@@ -1312,7 +1488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         unblock()
         updateStatusItem()
         Sound.sessionOver.play()
-        Notifier.post("Session over", "The session length has elapsed.")
+        Popup.shared.show("Session over", "The session length has elapsed.", for: 10)
     }
 
     private func begin(_ mode: Mode) {
@@ -1327,7 +1503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         case .opened:
             unblock()
             Sound.opened.play()
-            Notifier.post("Opened", "\(Config.clock(minutes: slot)) until Closed.")
+            Popup.shared.show("Opened", "\(Config.clock(minutes: slot)) until Closed")
         case .closed:
             block()
             render()
@@ -1342,7 +1518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         puzzle = nil
         unblock()
         Sound.escaped.play()
-        Notifier.post("Paused", "\(Config.clock(minutes: Config.pauseMinutes)) until Closed restarts.")
+        Popup.shared.show("Paused", "\(Config.clock(minutes: Config.pauseMinutes)) until Closed restarts")
         updateStatusItem()
     }
 
@@ -1395,14 +1571,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         updateStatusItem()
     }
 
-    /// §5: Opened → a notification; Closed → text on the blocked screen. Informational only.
+    /// §5: a pop-up in the middle of the screen, in both modes; Closed also keeps it on the
+    /// blocked screen. Informational only.
     private func remind(_ mode: Mode, minutes: Int) {
         let left = Config.clock(minutes: minutes)
         Sound.reminder.play()
-        switch mode {
-        case .opened: Notifier.post("Opened", "\(left) left.")
-        case .closed: reminderText = "\(left) left"
-        }
+        Popup.shared.show(left, "left in \(mode.title)")
+        if mode == .closed { reminderText = "\(left) left" }
     }
 
     // MARK: Escape puzzle (§6)
@@ -1503,9 +1678,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     private func block() {
         guard !isBlocked else { return }
         previousApp = NSWorkspace.shared.frontmostApplication
-        // The map's window steps aside: the overlay takes the map, and nothing closes it there.
-        mapWindowWasOpen = mapWindow?.isVisible ?? false
-        mapWindow?.orderOut(nil)
+        // The canvas's window steps aside: the overlay takes the canvas, and nothing closes it there.
+        canvasWindowWasOpen = canvasWindow?.isVisible ?? false
+        canvasWindow?.orderOut(nil)
         buildOverlays()
         regainFocus()
         // Keys for anything but our own windows go nowhere; the overlay windows decide the rest.
@@ -1524,13 +1699,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         }
         guard isBlocked else { return }
         closeOverlays()
-        // The map goes back to its window (open, or minimized in the Dock), which reappears if it
+        // The canvas goes back to its window (open, or minimized in the Dock), which reappears if it
         // was open before, under whatever app was in front.
-        if let window = mapWindow {
+        if let window = canvasWindow {
             window.attach()
-            if mapWindowWasOpen { window.orderFront(nil) }
+            if canvasWindowWasOpen { window.orderFront(nil) }
         }
-        mapWindowWasOpen = false
+        canvasWindowWasOpen = false
         if let app = previousApp, !app.isTerminated, app != NSRunningApplication.current {
             app.activate(options: [])
         }
@@ -1538,9 +1713,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     }
 
     private func closeOverlays() {
-        if let map = mindMap, map.webView.window is OverlayWindow {
-            map.commitEdits()
-            map.webView.removeFromSuperview()
+        if let canvas = canvas, canvas.webView.window is OverlayWindow {
+            canvas.commitEdits()
+            canvas.webView.removeFromSuperview()
         }
         overlays.forEach { $0.close() }
         overlays.removeAll()
@@ -1554,8 +1729,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
             w.orderFrontRegardless()
             return w
         }
-        // §10: the main screen (the first one, with the menu bar) holds the mind map.
-        if let map = mindMap { overlays.first?.attachMindMap(map.webView) }
+        // §10: the main screen (the first one, with the menu bar) holds the canvas.
+        if let canvas = canvas { overlays.first?.attachCanvas(canvas.webView) }
     }
 
     /// Keeps an overlay key and the app active for as long as the screen is blocked, so key

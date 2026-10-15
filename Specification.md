@@ -48,7 +48,7 @@ In both modes, a reminder states the time remaining. Reminders fire at halving i
 | 8 | 4:00, 2:00, 1:00 |
 | 4 | 2:00, 1:00 |
 
-- Opened: a notification. Closed: text on the blocked screen.
+- In both modes, a pop-up in the middle of every screen, above everything (the blocked screen included), with the time left and the mode. It never takes the keyboard and goes away by itself after a few seconds, or at a click. Closed also keeps the reminder in the strip on the blocked screen.
 - Reminders are informational only; they contain no controls and no puzzle.
 
 ## 6. Escape puzzle (Closed mode only)
@@ -71,7 +71,7 @@ The only way to leave Closed early.
 ## 8. Edge rules
 
 - Durations are always shown as `mm:ss`.
-- No action is available during a mode except the escape button and the mind map in Closed (§10).
+- No action is available during a mode except the escape button and the canvas in Closed (§10).
 - If the app is killed or the device restarts mid-session, it reopens to a confirmation for the mode that was interrupted, with its full slot.
 
 ## 9. Sounds
@@ -90,18 +90,22 @@ A short system sound marks every transition point, so the user hears a change wi
 | The session ends (§4) | Funk |
 
 - Sounds are the macOS system sounds of those names; a missing one is simply silent.
+- They play louder than the system plays them: 18 dB of gain followed by a peak limiter, so they don't distort (`soundBoost`, 0–24 dB). The reminder (Tink) and the solved puzzle (Pop) play three times in a row, since one is too short to notice.
 - Sounds are informational only and never replace the confirmation or a reminder's text.
 - Launching with `-mute YES` silences all of them.
 
-## 10. Mind map
+## 10. Canvas
 
-What blocks the screen in Closed is a mind map the user can work in (`Mind Maps.html`). It is also there whenever the screen isn't blocked, from its own menu-bar icon.
+What blocks the screen in Closed is a canvas the user writes on (`Canvas.html`). It is also there whenever the screen isn't blocked, from its own menu-bar icon.
 
-- When the screen isn't blocked, the mind-map icon (or **Open Mind Map** in the timer's menu) opens it in an ordinary window, which the user can close at any time. Clicking the icon again closes it.
-- When the screen is blocked, the map moves into the overlay and cannot be closed; an open window steps aside and comes back when the block ends.
+- The canvas is infinite: drag empty space or scroll to move around, pinch or ⌘-scroll to zoom.
+- On it are surfaces, written on directly (no separate edit mode). A surface can be dragged by its edge or its strip, resized from its corner, given one of twelve colours (or none), and deleted (a surface with text asks for a second click, and can be brought back for a few seconds after).
+- Double-clicking empty space starts a surface there; one left empty and untouched goes away again when you click elsewhere.
+- When the screen isn't blocked, the canvas icon (or **Open Canvas** in the timer's menu) opens it in an ordinary window, which the user can close at any time. Clicking the icon again closes it.
+- When the screen is blocked, the canvas moves into the overlay and cannot be closed; an open window steps aside and comes back when the block ends.
 
-- On the main screen (the one with the menu bar), Closed shows the mind map full screen, under a strip with the time left, the reminders (§5) and **I need out** (§6). Other screens keep the dark blocked screen.
-- Confirmations (§3) and the puzzle (§6) cover the mind map while they show; it comes back as it was.
-- The maps are kept on the Mac (`~/Library/Application Support/CountdownOverlay/mindmaps.json`) and carry over from one Closed to the next, and across sessions.
-- The mind map is a place to think, not a way out: it has no links, and leaves the block timer running.
+- On the main screen (the one with the menu bar), Closed shows the canvas full screen, under a strip with the time left, the reminders (§5) and **I need out** (§6). Other screens keep the dark blocked screen.
+- Confirmations (§3) and the puzzle (§6) cover the canvas while they show; it comes back as it was.
+- The surfaces are kept on the Mac (`~/Library/Application Support/CountdownOverlay/canvas.json`) and carry over from one Closed to the next, and across sessions.
+- The canvas is a place to think, not a way out: it has no links, and leaves the block timer running.
 - If the page is missing (a bare binary run away from the source), Closed shows the dark blocked screen.
