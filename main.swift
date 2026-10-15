@@ -1658,9 +1658,19 @@ final class MenuHeader: NSView {
         if key != pillKey {
             pillKey = key
             pill?.removeFromSuperview()
+            // Held at its leading edge only, so the stack can't stretch it across the menu.
             let new = Theme.pill(text, tint: tint, size: 9.5)
-            stack.insertArrangedSubview(new, at: 0)
-            pill = new
+            let holder = NSView()
+            holder.translatesAutoresizingMaskIntoConstraints = false
+            holder.addSubview(new)
+            NSLayoutConstraint.activate([
+                new.leadingAnchor.constraint(equalTo: holder.leadingAnchor),
+                new.topAnchor.constraint(equalTo: holder.topAnchor),
+                new.bottomAnchor.constraint(equalTo: holder.bottomAnchor),
+                new.trailingAnchor.constraint(lessThanOrEqualTo: holder.trailingAnchor),
+            ])
+            stack.insertArrangedSubview(holder, at: 0)
+            pill = holder
         }
         if time.stringValue != value { time.stringValue = value }
         bar.alphaValue = fraction == nil ? 0 : 1
