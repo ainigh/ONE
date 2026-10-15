@@ -7,9 +7,9 @@ confirmation box on the blocked screen, reminders announce the time left at halv
 and the only way out of Closed early is a small prime-arithmetic puzzle that buys a 20-minute
 pause. A system sound marks every transition point.
 
-In Closed, what covers the main screen is a mind map you can work in (`Mind Maps.html`), under a
-strip with the time left, the reminders and **I need out**. The rest of the time it's one click
-away: the second menu-bar icon (the brain) opens it in an ordinary window you can close.
+In Closed, what covers the main screen is a canvas you write on (`Canvas.html`), under a strip
+with the time left, the reminders and **I need out**. The rest of the time it's one click away: the
+second menu-bar icon (the pencil) opens it in an ordinary window you can close.
 
 The app is one Swift file, `main.swift`, plus that page, which the build copies into the bundle.
 
@@ -68,8 +68,8 @@ make run      # builds and opens it from build/
 Or just the bare binary, which still works but doesn't check for updates:
 
 ```sh
-swiftc -O -o CountdownOverlay main.swift -framework Cocoa
-./CountdownOverlay      # run from the checkout, so it finds Mind Maps.html
+swiftc -O -o CountdownOverlay main.swift -framework Cocoa -framework AVFoundation -framework WebKit
+./CountdownOverlay      # run from the checkout, so it finds Canvas.html
 ```
 
 Requires Xcode command line tools (`xcode-select --install`), macOS 11+.
@@ -79,19 +79,31 @@ Requires Xcode command line tools (`xcode-select --install`), macOS 11+.
 - Click the menubar icon → **Start Session** → pick 1, 2, 4 or 8 hours. The first confirmation
   (*Ready to start?*) appears at once; choose the slot (4 / 8 / 16 minutes) and press **Start**
   (Return works too).
-- **Opened**: the screen is free, the menubar shows `mm:ss` left, and reminders arrive as
-  notifications (allow them when macOS asks).
-- **Closed**: the main screen shows the mind map (your maps are kept in
-  `~/Library/Application Support/CountdownOverlay/mindmaps.json` and come back every Closed);
-  the strip above it, and every other screen, show `mm:ss` left and the reminders. **I need out** opens the puzzle:
+- **Reminders** pop up in the middle of every screen, above everything (the blocked screen
+  included), with the time left: `08:00 left in Opened`. They never take the keyboard, go away
+  after a few seconds, and a click dismisses them sooner. Opened starting, a pause and the end of
+  the session pop up the same way.
+- **Opened**: the screen is free and the menubar shows `mm:ss` left.
+- **Closed**: the main screen shows the canvas; the strip above it, and every other screen, show
+  `mm:ss` left and the reminders. **I need out** opens the puzzle:
   a correct answer pauses everything for 20 minutes, three wrong ones disable the button for
   2 minutes. One successful escape per hour; the button is hidden on cooldown.
+- **The canvas** is an infinite surface for notes. Double-click anywhere (or **+ Surface**) to
+  start a surface and write straight on it. Drag a surface by its edge or the dotted strip on its
+  right, resize it from the bottom-right corner, colour it from the dot in the strip, delete it
+  with ×. Drag empty space (or scroll) to move around; pinch or ⌘-scroll to zoom; the corner
+  button shows everything. It's kept in
+  `~/Library/Application Support/CountdownOverlay/canvas.json` and comes back every Closed and
+  every time you open it. (Maps from the old mind map stay in `mindmaps.json`; nothing reads them now.)
 - The session ends at the first confirmation after the chosen length. Quit and updates are
   disabled during a session; if the app is killed or the Mac restarts, it reopens to a
   confirmation for the interrupted mode.
-- Sounds at each transition are listed in `Specification.md` §9. Launch with `-mute YES` to
-  silence them, or `-minute 2` to make an app minute 2 seconds long and try the whole cycle
-  quickly. `-h` / `--help` prints usage, `--version` the version and commit.
+- Sounds at each transition are listed in `Specification.md` §9. They play 18 dB louder than
+  macOS plays them (through a limiter, so they don't distort); the system volume still sets the
+  ceiling. Change the boost with
+  `defaults write com.ainigh.CountdownOverlay soundBoost 24` (0 to 24 dB). Launch with
+  `-mute YES` to silence them, or `-minute 2` to make an app minute 2 seconds long and try the
+  whole cycle quickly. `-h` / `--help` prints usage, `--version` the version and commit.
 
   ```sh
   ./CountdownOverlay -minute 2
@@ -103,7 +115,7 @@ Requires Xcode command line tools (`xcode-select --install`), macOS 11+.
 - Every countdown is derived from a deadline, not a once-per-second tick, so it
   never drifts and resolves correctly if the Mac sleeps mid-mode.
 - While the screen is blocked, key events only reach the overlay windows, which
-  pass Return to their buttons and typing to the puzzle's answer field or the mind map, and swallow
+  pass Return to their buttons and typing to the puzzle's answer field or the canvas, and swallow
   everything else; the app re-activates itself if it loses focus, so Cmd-Q / Esc
   can't slip through via another window.
 - Overlays are rebuilt (coalesced, after a short delay) when displays are
