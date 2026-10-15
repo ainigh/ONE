@@ -372,9 +372,9 @@ enum Theme {
             pill.heightAnchor.constraint(equalToConstant: size * 1.9),
             label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
             label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: size * 0.9),
-            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -size * 0.75),
+            // As wide as its words, wherever it sits (a stack would otherwise stretch it).
+            pill.widthAnchor.constraint(equalTo: label.widthAnchor, constant: size * 1.65),
         ])
-        pill.setContentHuggingPriority(.required, for: .horizontal)
         pill.setAccessibilityElement(true)
         pill.setAccessibilityRole(.staticText)
         pill.setAccessibilityLabel(text)
