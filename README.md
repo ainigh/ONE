@@ -76,9 +76,10 @@ Requires Xcode command line tools (`xcode-select --install`), macOS 11+.
 
 ## Use
 
-- Click the menubar icon → **Start Session** → pick 1, 2, 4 or 8 hours. The first confirmation
-  (*Ready to start?*) appears at once; choose the slot (4 / 8 / 16 minutes) and press **Start**
-  (Return works too).
+- Click the menubar icon → **Start Session** → pick 10 minutes, or 1, 2, 4 or 8 hours. The first
+  confirmation (*Ready to start?*) appears at once; choose the slot (4 / 8 / 16 minutes) and press
+  **Start** (Return works too). 10 minutes is for trying the flow: pick 4 at each confirmation to
+  see Opened, Closed and Opened again before the session ends.
 - **Reminders** pop up in the middle of every screen, above everything (the blocked screen
   included), with the time left: `08:00 left in Opened`. They never take the keyboard, go away
   after a few seconds, and a click dismisses them sooner. Opened starting, a pause and the end of

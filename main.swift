@@ -16,8 +16,15 @@ enum Config {
     /// Allowed slot values, in minutes (§2).
     static let slots = [4, 8, 16]
     static let defaultSlots: [Mode: Int] = [.opened: 16, .closed: 4]
-    /// Session lengths offered at activation, in hours (§4).
-    static let sessionHours = [1, 2, 4, 8]
+    /// Session lengths offered at activation, in minutes (§4). The 10-minute one is for trying
+    /// the flow: with 4-minute slots it runs Opened, Closed, then Opened again before it ends.
+    static let sessionMinutes = [10, 60, 120, 240, 480]
+
+    /// "10 minutes", "1 hour", "2 hours".
+    static func sessionTitle(minutes: Int) -> String {
+        if minutes % 60 != 0 { return "\(minutes) minutes" }
+        return minutes == 60 ? "1 hour" : "\(minutes / 60) hours"
+    }
     static let pauseMinutes = 20                   // §7
     static let puzzleAttempts = 3                  // §6
     static let lockoutMinutes = 2                  // §6: after the third wrong answer
@@ -1373,11 +1380,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         start.isEnabled = canStart
         let lengths = NSMenu()
         lengths.autoenablesItems = false
-        for hours in Config.sessionHours {
-            let item = lengths.addItem(withTitle: hours == 1 ? "1 hour" : "\(hours) hours",
+        for minutes in Config.sessionMinutes {
+            let item = lengths.addItem(withTitle: Config.sessionTitle(minutes: minutes),
                                        action: #selector(startSession(_:)), keyEquivalent: "")
             item.target = self
-            item.tag = hours
+            item.tag = minutes
             item.isEnabled = canStart
         }
         start.submenu = lengths
@@ -1455,8 +1462,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     // MARK: Session (§4)
 
     @objc private func startSession(_ sender: NSMenuItem) {
-        guard !inSession, !updater.isInstalling, Config.sessionHours.contains(sender.tag) else { return }
-        sessionEnd = Date().addingTimeInterval(Config.seconds(minutes: sender.tag * 60))
+        guard !inSession, !updater.isInstalling, Config.sessionMinutes.contains(sender.tag) else { return }
+        sessionEnd = Date().addingTimeInterval(Config.seconds(minutes: sender.tag))
         Store.sessionEnd = sessionEnd
         firstConfirmation = true
         startTicking()

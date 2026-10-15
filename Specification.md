@@ -34,7 +34,7 @@ Shown before every mode change, including the first mode of a session. The timer
 ## 4. Session
 
 - Activation shows the first confirmation immediately. The first mode is **Opened**.
-- At activation the user picks a session length: **1 h, 2 h, 4 h, 8 h**. (Chosen for you — some end condition is required or the session never terminates.)
+- At activation the user picks a session length: **10 min, 1 h, 2 h, 4 h, 8 h**. (Chosen for you — some end condition is required or the session never terminates. 10 minutes is for trying the flow: with 4-minute slots it runs Opened, Closed, then Opened again before the session ends at the next confirmation.)
 - The session ends at the first confirmation reached after the session length has elapsed. The timer never ends mid-mode.
 - The session cannot be ended or paused by any other control.
 
