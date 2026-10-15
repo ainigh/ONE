@@ -360,6 +360,8 @@ enum Theme {
             .kern: size * 0.14,
         ])
         label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
         let pill = NSView()
         pill.wantsLayer = true
         pill.layer?.backgroundColor = tint.withAlphaComponent(0.14).cgColor
