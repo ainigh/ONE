@@ -1,8 +1,11 @@
 # CountdownOverlay
 
-Menubar app: click the timer icon → every connected screen is covered by a
-dark overlay with a 5-second countdown in the center. Esc, Cmd-W, Cmd-Q and
-clicks are swallowed while it runs; it dismisses itself at 0.
+Menubar app that runs the Opened / Closed session timer described in `Specification.md`:
+a session alternates between **Opened** (screen free) and **Closed** (every connected screen
+covered by a dark overlay), each 4, 8 or 16 minutes long. Every mode change goes through a
+confirmation box on the blocked screen, reminders announce the time left at halving intervals,
+and the only way out of Closed early is a small prime-arithmetic puzzle that buys a 20-minute
+pause. A system sound marks every transition point.
 
 The whole app is one Swift file, `main.swift`.
 
@@ -38,7 +41,7 @@ offers:
   builds it on this Mac, swaps itself and reopens. Build output goes to
   `~/Library/Logs/CountdownOverlay/update.log`.
 
-Updating is offered only between countdowns, since it restarts the app. If an update fails,
+Updating is offered only between sessions, since it restarts the app. If an update fails,
 **Copy Update Details** copies the error and the end of the log.
 
 GitHub Actions (`.github/workflows/build.yml`) builds every push and publishes a release
@@ -69,34 +72,44 @@ Requires Xcode command line tools (`xcode-select --install`), macOS 11+.
 
 ## Use
 
-- **Left-click** the menubar icon → start countdown.
-- **Right-click** → menu with Start / version / updates / Quit (Start, Update and Quit are
-  disabled during a countdown).
-- The length defaults to 5 seconds. Override it per launch with an argument
-  or an environment variable (argument wins; values outside 1–3600 fall back
-  to the default). `-h` / `--help` prints usage, `--version` the version and commit.
+- Click the menubar icon → **Start Session** → pick 1, 2, 4 or 8 hours. The first confirmation
+  (*Ready to start?*) appears at once; choose the slot (4 / 8 / 16 minutes) and press **Start**
+  (Return works too).
+- **Opened**: the screen is free, the menubar shows `mm:ss` left, and reminders arrive as
+  notifications (allow them when macOS asks).
+- **Closed**: the overlay shows `mm:ss` left and the reminders. **I need out** opens the puzzle:
+  a correct answer pauses everything for 20 minutes, three wrong ones disable the button for
+  2 minutes. One successful escape per hour; the button is hidden on cooldown.
+- The session ends at the first confirmation after the chosen length. Quit and updates are
+  disabled during a session; if the app is killed or the Mac restarts, it reopens to a
+  confirmation for the interrupted mode.
+- Sounds at each transition are listed in `Specification.md` §9. Launch with `-mute YES` to
+  silence them, or `-minute 2` to make an app minute 2 seconds long and try the whole cycle
+  quickly. `-h` / `--help` prints usage, `--version` the version and commit.
 
   ```sh
-  ./CountdownOverlay -duration 10
-  COUNTDOWN_SECONDS=10 ./CountdownOverlay
+  ./CountdownOverlay -minute 2
+  ./CountdownOverlay -mute YES
   ```
 
 ## Robustness notes
 
-- The count is derived from a deadline, not a once-per-second tick, so it
-  never drifts and resolves correctly if the Mac sleeps mid-countdown.
-- All key events to the process are swallowed by a local event monitor, and
-  the app re-activates itself if it loses focus, so Cmd-Q / Esc can't slip
-  through via another window.
+- Every countdown is derived from a deadline, not a once-per-second tick, so it
+  never drifts and resolves correctly if the Mac sleeps mid-mode.
+- While the screen is blocked, key events only reach the overlay windows, which
+  pass Return to their buttons and typing to the puzzle's answer field and swallow
+  everything else; the app re-activates itself if it loses focus, so Cmd-Q / Esc
+  can't slip through via another window.
 - Overlays are rebuilt (coalesced, after a short delay) when displays are
   added, removed or resized, and placed in global coordinates so secondary
   displays are covered correctly.
-- The cursor is hidden and the menubar icon dims while the countdown runs.
 - The digits scale with the smallest screen dimension.
-- Focus returns to the app that was frontmost before the countdown started.
+- Focus returns to the app that was frontmost before the screen was blocked.
+- Session end, the interrupted mode, the slots and the escape cooldown are kept in
+  user defaults, so a relaunch lands on the right confirmation.
 
 ## What can't be blocked
 
 Cmd-Option-Esc (Force Quit), Mission Control gestures and the power button are
-reserved by macOS. For a 5-second overlay that's acceptable; the app simply
+reserved by macOS. The puzzle is friction, not security (Specification §6); the app simply
 makes casual dismissal (Esc, click, Cmd-Q) impossible.

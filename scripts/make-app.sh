@@ -39,7 +39,7 @@ mkdir -p build/obj
 
 compile() { # compile <arch> <output>
   echo "==> swiftc ($1)"
-  swiftc -O -target "$1-apple-macos$MIN_MACOS" -framework Cocoa -o "$2" main.swift
+  swiftc -O -target "$1-apple-macos$MIN_MACOS" -framework Cocoa -framework UserNotifications -o "$2" main.swift
 }
 
 if [ "${UNIVERSAL:-0}" = 1 ]; then

@@ -13,7 +13,7 @@ DEST := $(HOME)/Applications/$(NAME).app
 
 build:
 	mkdir -p build
-	swiftc -O -o build/$(NAME) main.swift -framework Cocoa
+	swiftc -O -o build/$(NAME) main.swift -framework Cocoa -framework UserNotifications
 
 app:
 	scripts/make-app.sh
