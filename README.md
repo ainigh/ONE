@@ -14,7 +14,7 @@ The whole app is one Swift file, `main.swift`.
 Paste this in Terminal (macOS 11 or newer):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ainigh/ONE-FILE-SWIFT/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ainigh/ONE/main/install.sh | bash
 ```
 
 It downloads the latest release into `~/Applications/CountdownOverlay.app` and opens it. If
@@ -25,7 +25,7 @@ as it opens, the installer puts the one you had back. Running the line again is 
 To install a branch that isn't merged yet, and follow that branch for updates:
 
 ```sh
-curl -fsSL "https://raw.githubusercontent.com/ainigh/ONE-FILE-SWIFT/BRANCH/install.sh" | BRANCH=BRANCH bash
+curl -fsSL "https://raw.githubusercontent.com/ainigh/ONE/BRANCH/install.sh" | BRANCH=BRANCH bash
 ```
 
 ## Updates
