@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds build/CountdownOverlay.app and build/CountdownOverlay.zip (what a release carries) from
-# main.swift, with Canvas.html as the page Closed shows. Needs a Mac with Apple's command line tools (xcode-select --install).
+# main.swift, with Canvas.html as the page Closed shows and assets/AppIcon.icns as its icon. Needs a Mac with Apple's command line tools (xcode-select --install).
 #
 #   scripts/make-app.sh                            a local build
 #   VERSION=1.0.7 BRANCH=main scripts/make-app.sh  what CI and the in-app updater run
@@ -39,7 +39,7 @@ mkdir -p build/obj
 
 compile() { # compile <arch> <output>
   echo "==> swiftc ($1)"
-  swiftc -O -target "$1-apple-macos$MIN_MACOS" -framework Cocoa -framework AVFoundation -framework WebKit -o "$2" main.swift
+  swiftc -O -target "$1-apple-macos$MIN_MACOS" -framework Cocoa -framework AVFoundation -framework ServiceManagement -framework WebKit -o "$2" main.swift
 }
 
 if [ "${UNIVERSAL:-0}" = 1 ]; then
@@ -55,6 +55,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "build/obj/$NAME" "$APP/Contents/MacOS/$NAME"
 cp Info.plist "$APP/Contents/Info.plist"
 cp Canvas.html "$APP/Contents/Resources/Canvas.html"
+cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 $PB -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
 $PB -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
 $PB -c "Add :CountdownCommit string $COMMIT" "$APP/Contents/Info.plist"

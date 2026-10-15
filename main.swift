@@ -1,5 +1,6 @@
 import AVFoundation
 import Cocoa
+import ServiceManagement
 import WebKit
 
 // MARK: - Model
@@ -47,6 +48,10 @@ enum Config {
         guard UserDefaults.standard.object(forKey: "soundBoost") != nil else { return 18 }
         return min(max(UserDefaults.standard.float(forKey: "soundBoost"), 0), 24)
     }
+    /// The loudness choices in the Sound menu, in dB of boost.
+    static let loudness: [(title: String, boost: Float)] = [
+        ("As macOS plays them", 0), ("Loud", 12), ("Louder", 18), ("Loudest", 24),
+    ]
 
     static func seconds(minutes: Int) -> TimeInterval { Double(minutes) * secondsPerMinute }
 
@@ -58,6 +63,25 @@ enum Config {
 
     /// `mm:ss` of a whole number of minutes.
     static func clock(minutes: Int) -> String { String(format: "%02d:%02d", minutes, 0) }
+
+    /// "3 h 12 min", "12 min", "under a minute": a longer stretch, in the app's minutes.
+    static func duration(_ interval: TimeInterval) -> String {
+        let minutes = Int(ceil(interval / secondsPerMinute - 0.0001))
+        if minutes <= 0 { return "under a minute" }
+        if minutes < 60 { return "\(minutes) min" }
+        return minutes % 60 == 0 ? "\(minutes / 60) h" : "\(minutes / 60) h \(minutes % 60) min"
+    }
+
+    /// The wall-clock time an interval from now lands on, as the Mac shows times ("3:46 PM").
+    static func wallTime(in interval: TimeInterval) -> String {
+        timeFormatter.string(from: Date().addingTimeInterval(interval))
+    }
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f
+    }()
 
     /// Reminder marks for a slot (§5): halving intervals, none under one minute from the end.
     static func reminders(forSlot slot: Int) -> [Int] {
@@ -78,10 +102,13 @@ enum Config {
       -minute N       real seconds per app minute, 1...60 (default 60), to try the cycle quickly
       -mute YES       no sounds at transitions
       -soundBoost N   how much louder than the system the sounds play, 0...24 dB (default 18)
+      -preview DIR    draw the blocked screens, a pop-up and the menu into PNGs in DIR, then quit
       -h, --help      show this help
       --version       print the version and commit this copy was built from
     """
 }
+
+// MARK: - Sound (Specification §9)
 
 /// Sounds at transition points, from the system set in /System/Library/Sounds.
 enum Sound: String {
@@ -121,7 +148,7 @@ final class SoundPlayer {
         componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_PeakLimiter,
         componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0))
     private var buffers: [String: AVAudioPCMBuffer] = [:]
-    private var playing = 0
+    private var active: [ObjectIdentifier: AVAudioPlayerNode] = [:]   // playing right now
     private var stopWork: DispatchWorkItem?
 
     private init() {
@@ -130,7 +157,14 @@ final class SoundPlayer {
         engine.connect(bus, to: gain, format: nil)
         engine.connect(gain, to: limiter, format: nil)
         engine.connect(limiter, to: engine.mainMixerNode, format: nil)
+        // Headphones plugged in or out, a new output device: the engine stops itself, and the
+        // sounds that were playing never report back. Let go of them; the next sound restarts it.
+        NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
+                                               queue: .main) { [weak self] _ in self?.reset() }
     }
+
+    /// Picks up a new loudness from the Sound menu.
+    func updateBoost() { gain.globalGain = Config.soundBoost }
 
     func play(_ name: String, times: Int) {
         guard let buffer = buffer(named: name), start() else {
@@ -145,27 +179,44 @@ final class SoundPlayer {
         // Repeats follow each other with a short gap, on the player's own clock.
         let rate = buffer.format.sampleRate
         let step = Double(buffer.frameLength) / rate + 0.09
-        for i in 0..<max(times, 1) {
+        let count = max(times, 1)
+        for i in 0..<count {
             let at = AVAudioTime(sampleTime: AVAudioFramePosition(Double(i) * step * rate), atRate: rate)
-            let last = i == max(times, 1) - 1
+            let last = i == count - 1
             player.scheduleBuffer(buffer, at: at, options: [], completionCallbackType: .dataPlayedBack) { _ in
                 guard last else { return }
-                DispatchQueue.main.async { self.finished(player) }
+                DispatchQueue.main.async { [weak self] in self?.finished(player) }
             }
         }
-        playing += 1
+        active[ObjectIdentifier(player)] = player
         stopWork?.cancel()
         player.play()
     }
 
     private func finished(_ player: AVAudioPlayerNode) {
+        // Already let go of (by a reset): nothing to do.
+        guard active.removeValue(forKey: ObjectIdentifier(player)) != nil else { return }
         player.stop()
         engine.detach(player)
-        playing -= 1
-        guard playing == 0 else { return }
-        // Let go of the audio hardware once it's been quiet for a moment.
+        scheduleStop()
+    }
+
+    private func reset() {
+        let players = Array(active.values)
+        active.removeAll()
+        for player in players {
+            player.stop()
+            engine.detach(player)
+        }
+        scheduleStop()
+    }
+
+    /// Lets go of the audio hardware once it's been quiet for a moment.
+    private func scheduleStop() {
+        guard active.isEmpty else { return }
+        stopWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self = self, self.playing == 0 else { return }
+            guard let self = self, self.active.isEmpty, self.engine.isRunning else { return }
             self.engine.stop()
         }
         stopWork = work
@@ -218,7 +269,8 @@ struct Puzzle {
 }
 
 /// What survives the app being killed or the Mac restarting (§8): enough to reopen to a
-/// confirmation for the interrupted mode, plus the slots and the escape cooldown.
+/// confirmation for the interrupted mode, plus the slots, the escape cooldown and the session's
+/// tally of Closed rounds.
 enum Store {
     private static let d = UserDefaults.standard
 
@@ -230,6 +282,15 @@ enum Store {
     static var interruptedMode: Mode? {
         get { d.string(forKey: "session.mode").flatMap(Mode.init(rawValue:)) }
         set { d.set(newValue?.rawValue, forKey: "session.mode") }
+    }
+    /// Closed rounds finished in this session, and their minutes.
+    static var closedRounds: Int {
+        get { d.integer(forKey: "session.closedRounds") }
+        set { d.set(newValue, forKey: "session.closedRounds") }
+    }
+    static var closedMinutes: Int {
+        get { d.integer(forKey: "session.closedMinutes") }
+        set { d.set(newValue, forKey: "session.closedMinutes") }
     }
     static var lastEscape: Date? {
         get { d.object(forKey: "escape.last") as? Date }
@@ -245,6 +306,216 @@ enum Store {
     static func clearSession() {
         sessionEnd = nil
         interruptedMode = nil
+        closedRounds = 0
+        closedMinutes = 0
+    }
+}
+
+// MARK: - Look
+
+/// The palette of the canvas (and "example style for node.md"), so every surface of the app
+/// speaks the same language: teal for Opened, amber for Closed, on a dark green-grey ground.
+enum Theme {
+    static func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> NSColor {
+        NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
+                blue: CGFloat(hex & 0xff) / 255, alpha: alpha)
+    }
+    static let ground = color(0x141917)
+    static let ink = color(0xe5eae6)
+    static let muted = color(0x8d9a93)
+    static let faint = color(0x5f6b65)
+    static let opened = color(0x6fc3ad)
+    static let closed = color(0xeba35a)
+    static let rust = color(0xd6735c)
+    static func tint(_ mode: Mode) -> NSColor { mode == .opened ? opened : closed }
+
+    /// The rounded system face, with digits that don't jiggle as they count down.
+    static func digits(_ size: CGFloat, _ weight: NSFont.Weight = .bold) -> NSFont {
+        let base = NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight)
+        guard let rounded = base.fontDescriptor.withDesign(.rounded) else { return base }
+        return NSFont(descriptor: rounded, size: size) ?? base
+    }
+
+    static func rounded(_ size: CGFloat, _ weight: NSFont.Weight) -> NSFont {
+        let base = NSFont.systemFont(ofSize: size, weight: weight)
+        guard let rounded = base.fontDescriptor.withDesign(.rounded) else { return base }
+        return NSFont(descriptor: rounded, size: size) ?? base
+    }
+
+    static func label(_ text: String, font: NSFont, color: NSColor = ink,
+                      align: NSTextAlignment = .center, wraps: Bool = true) -> NSTextField {
+        let l = wraps ? NSTextField(wrappingLabelWithString: text) : NSTextField(labelWithString: text)
+        l.font = font
+        l.textColor = color
+        l.alignment = align
+        return l
+    }
+
+    /// A small capsule naming a mode or state: "CLOSED", tinted.
+    static func pill(_ text: String, tint: NSColor, size: CGFloat) -> NSView {
+        let words = NSAttributedString(string: text.uppercased(), attributes: [
+            .font: NSFont.systemFont(ofSize: size, weight: .bold),
+            .foregroundColor: tint,
+            .kern: size * 0.14,
+        ])
+        let label = NSTextField(labelWithString: "")
+        label.attributedStringValue = words
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentHuggingPriority(.required, for: .horizontal)
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.backgroundColor = tint.withAlphaComponent(0.14).cgColor
+        pill.layer?.borderColor = tint.withAlphaComponent(0.35).cgColor
+        pill.layer?.borderWidth = 1
+        pill.layer?.cornerRadius = (size * 1.9) / 2
+        pill.addSubview(label)
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            pill.heightAnchor.constraint(equalToConstant: size * 1.9),
+            label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: size * 0.9),
+            // As wide as its words, measured, wherever it sits (a stack would otherwise stretch it).
+            pill.widthAnchor.constraint(equalToConstant: ceil(words.size().width) + size * 1.9),
+        ])
+        pill.setAccessibilityElement(true)
+        pill.setAccessibilityRole(.staticText)
+        pill.setAccessibilityLabel(text)
+        return pill
+    }
+
+    /// A rounded mask for visual-effect views, which ignore their layer's corner radius.
+    static func roundedMask(radius: CGFloat) -> NSImage {
+        let edge = radius * 2 + 1
+        let image = NSImage(size: NSSize(width: edge, height: edge), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        image.resizingMode = .stretch
+        return image
+    }
+}
+
+/// A thin rounded bar showing how much of something is left.
+final class ProgressBar: NSView {
+    private let fill = CALayer()
+    private var draining = false
+
+    var fraction: CGFloat = 1 {
+        didSet { if abs(fraction - oldValue) > 0.0005 { needsLayout = true } }
+    }
+    var tint: NSColor = Theme.closed {
+        didSet { fill.backgroundColor = tint.cgColor }
+    }
+
+    init(height: CGFloat, track: NSColor = NSColor(white: 1, alpha: 0.12)) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 100, height: height))
+        wantsLayer = true
+        layer?.backgroundColor = track.cgColor
+        layer?.cornerRadius = height / 2
+        layer?.masksToBounds = true
+        fill.backgroundColor = tint.cgColor
+        fill.cornerRadius = height / 2
+        layer?.addSublayer(fill)
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: height).isActive = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if draining {
+            fill.frame = bounds
+        } else {
+            fill.frame = NSRect(x: 0, y: 0, width: bounds.width * max(0, min(1, fraction)), height: bounds.height)
+        }
+        CATransaction.commit()
+        setAccessibilityValue(NSNumber(value: Double(fraction)))
+    }
+
+    /// Empties smoothly from full over `seconds`, on its own (the pop-up's countdown).
+    func drain(over seconds: TimeInterval) {
+        draining = true
+        layoutSubtreeIfNeeded()
+        fill.anchorPoint = CGPoint(x: 0, y: 0.5)
+        fill.frame = bounds
+        let a = CABasicAnimation(keyPath: "transform.scale.x")
+        a.fromValue = 1
+        a.toValue = 0
+        a.duration = seconds
+        a.fillMode = .forwards
+        a.isRemovedOnCompletion = false
+        fill.add(a, forKey: "drain")
+    }
+}
+
+/// The menu-bar icon, drawn rather than picked: a ring whose pie is the time left in the mode,
+/// so a glance at the menu bar says how far along you are. Template images, so they follow the
+/// menu bar's colour.
+enum StatusIcon {
+    enum Kind: Hashable {
+        case idle                                  // the cycle: half Opened, half Closed
+        case ready                                 // waiting for Start
+        case left(Int)                             // how many of `steps` of the mode are still to go
+        case paused
+    }
+    static let steps = 48
+    private static var cache: [Kind: NSImage] = [:]
+
+    static func kind(left fraction: Double) -> Kind {
+        .left(max(1, min(steps, Int(ceil(fraction * Double(steps))))))
+    }
+
+    static func image(_ kind: Kind) -> NSImage {
+        if let image = cache[kind] { return image }
+        let image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
+            let ringRect = rect.insetBy(dx: 1.25, dy: 1.25)
+            let center = NSPoint(x: rect.midX, y: rect.midY)
+            let inner = ringRect.width / 2 - 2.25
+            NSColor.black.set()
+            let ring = NSBezierPath(ovalIn: ringRect)
+            ring.lineWidth = 1.5
+            ring.stroke()
+            switch kind {
+            case .idle:
+                let half = NSBezierPath()
+                half.move(to: center)
+                half.appendArc(withCenter: center, radius: inner, startAngle: 90, endAngle: 270)
+                half.close()
+                half.fill()
+            case .ready:
+                NSBezierPath(ovalIn: NSRect(x: center.x - 2.25, y: center.y - 2.25, width: 4.5, height: 4.5)).fill()
+            case .left(let step):
+                let sweep = 360 * CGFloat(step) / CGFloat(steps)
+                if sweep >= 359.9 {
+                    NSBezierPath(ovalIn: NSRect(x: center.x - inner, y: center.y - inner,
+                                                width: inner * 2, height: inner * 2)).fill()
+                } else {
+                    let pie = NSBezierPath()
+                    pie.move(to: center)
+                    pie.appendArc(withCenter: center, radius: inner, startAngle: 90,
+                                  endAngle: 90 - sweep, clockwise: true)
+                    pie.close()
+                    pie.fill()
+                }
+            case .paused:
+                for dx in [-2.0, 1.0] as [CGFloat] {
+                    NSBezierPath(roundedRect: NSRect(x: center.x + dx - 0.5, y: center.y - 3, width: 2, height: 6),
+                                 xRadius: 0.8, yRadius: 0.8).fill()
+                }
+            }
+            return true
+        }
+        image.isTemplate = true
+        cache[kind] = image
+        return image
     }
 }
 
@@ -252,27 +523,36 @@ enum Store {
 
 /// Reminders and the other things worth knowing mid-session, in the middle of every screen and
 /// above everything, the blocked screen included. It never takes focus, so typing carries on;
-/// it goes away by itself after a few seconds, or at a click.
+/// it goes away by itself after a few seconds (the bar along its bottom counts them down), or at
+/// a click. VoiceOver reads it out.
 final class Popup {
     static let shared = Popup()
     private var panels: [PopupPanel] = []
     private var hideWork: DispatchWorkItem?
 
-    func show(_ headline: String, _ detail: String, for seconds: TimeInterval = 6) {
+    func show(_ headline: String, _ detail: String, symbol: String, tint: NSColor,
+              for seconds: TimeInterval = 6) {
         hideWork?.cancel()
         panels.forEach { $0.close() }
         panels = NSScreen.screens.map { screen in
-            let panel = PopupPanel(screen: screen, headline: headline, detail: detail) { [weak self] in
-                self?.hide()
-            }
+            let panel = PopupPanel(screen: screen, headline: headline, detail: detail, symbol: symbol,
+                                   tint: tint, seconds: seconds) { [weak self] in self?.hide() }
+            let final = panel.frame
+            panel.setFrame(final.offsetBy(dx: 0, dy: -14), display: false)
             panel.alphaValue = 0
             panel.orderFrontRegardless()
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.15
+                context.duration = 0.22
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 panel.animator().alphaValue = 1
+                panel.animator().setFrame(final, display: true)
             }
             return panel
         }
+        NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested, userInfo: [
+            .announcement: "\(headline). \(detail)",
+            .priority: NSAccessibilityPriorityLevel.high.rawValue,
+        ])
         let work = DispatchWorkItem { [weak self] in self?.hide() }
         hideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
@@ -283,8 +563,9 @@ final class Popup {
         hideWork = nil
         let leaving = panels
         panels = []
+        guard !leaving.isEmpty else { return }
         NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.4
+            context.duration = 0.35
             leaving.forEach { $0.animator().alphaValue = 0 }
         }, completionHandler: {
             leaving.forEach { $0.close() }
@@ -293,16 +574,18 @@ final class Popup {
 }
 
 final class PopupPanel: NSPanel {
-    /// The panel's content: hands a click to the panel, even the first one on an inactive app.
+    /// Hands a click to the pop-up, even the first one while another app is active.
     private final class ClickView: NSView {
         var onClick: (() -> Void)?
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         override func mouseDown(with event: NSEvent) { onClick?() }
+        override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
     }
 
-    init(screen: NSScreen, headline: String, detail: String, onClick: @escaping () -> Void) {
+    init(screen: NSScreen, headline: String, detail: String, symbol: String, tint: NSColor,
+         seconds: TimeInterval, onClick: @escaping () -> Void) {
         let shortSide = min(screen.frame.width, screen.frame.height)
-        let size = NSSize(width: min(max(shortSide * 0.6, 380), 620), height: min(max(shortSide * 0.3, 200), 300))
+        let size = NSSize(width: min(max(shortSide * 0.5, 380), 560), height: min(max(shortSide * 0.3, 220), 300))
         let frame = NSRect(x: screen.frame.midX - size.width / 2, y: screen.frame.midY - size.height / 2,
                            width: size.width, height: size.height)
         super.init(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
@@ -317,35 +600,60 @@ final class PopupPanel: NSPanel {
         isReleasedWhenClosed = false
         isExcludedFromWindowsMenu = true
         animationBehavior = .none
+        appearance = NSAppearance(named: .darkAqua)
 
+        let radius: CGFloat = 28
         let content = ClickView(frame: NSRect(origin: .zero, size: size))
         content.onClick = onClick
-        content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor(white: 0.08, alpha: 0.94).cgColor
-        content.layer?.cornerRadius = 28
-        content.layer?.borderWidth = 1
-        content.layer?.borderColor = NSColor(white: 1, alpha: 0.14).cgColor
 
-        let big = NSTextField(labelWithString: headline)
-        big.font = NSFont.monospacedDigitSystemFont(ofSize: size.height * 0.34, weight: .bold)
-        big.textColor = .white
-        big.alignment = .center
-        let small = NSTextField(wrappingLabelWithString: detail)
-        small.font = NSFont.systemFont(ofSize: size.height * 0.11, weight: .medium)
-        small.textColor = NSColor.white.withAlphaComponent(0.8)
-        small.alignment = .center
-        let stack = NSStackView(views: [big, small])
+        let blur = NSVisualEffectView(frame: content.bounds)
+        blur.material = .hudWindow
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        blur.maskImage = Theme.roundedMask(radius: radius)
+        blur.autoresizingMask = [.width, .height]
+        content.addSubview(blur)
+
+        let tintWash = NSView(frame: content.bounds)
+        tintWash.wantsLayer = true
+        tintWash.layer?.cornerRadius = radius
+        tintWash.layer?.backgroundColor = Theme.ground.withAlphaComponent(0.55).cgColor
+        tintWash.layer?.borderWidth = 1
+        tintWash.layer?.borderColor = tint.withAlphaComponent(0.35).cgColor
+        tintWash.autoresizingMask = [.width, .height]
+        content.addSubview(tintWash)
+
+        var views: [NSView] = []
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: size.height * 0.1, weight: .semibold)) {
+            let icon = NSImageView(image: image)
+            icon.contentTintColor = tint
+            views.append(icon)
+        }
+        views.append(Theme.label(headline, font: Theme.digits(size.height * 0.27, .bold), color: Theme.ink, wraps: false))
+        views.append(Theme.label(detail, font: Theme.rounded(size.height * 0.085, .medium), color: Theme.ink.withAlphaComponent(0.78)))
+        let stack = NSStackView(views: views)
         stack.orientation = .vertical
         stack.alignment = .centerX
-        stack.spacing = size.height * 0.05
+        stack.spacing = size.height * 0.035
+        stack.setCustomSpacing(size.height * 0.05, after: views[0])
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
+
+        let bar = ProgressBar(height: 4, track: NSColor(white: 1, alpha: 0.08))
+        bar.tint = tint.withAlphaComponent(0.85)
+        content.addSubview(bar)
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: content.centerYAnchor),
-            stack.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, multiplier: 0.88),
+            stack.centerYAnchor.constraint(equalTo: content.centerYAnchor, constant: -4),
+            stack.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, multiplier: 0.86),
+            bar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: radius),
+            bar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -radius),
+            bar.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16),
         ])
         contentView = content
+        content.layoutSubtreeIfNeeded()
+        bar.drain(over: seconds)
         setAccessibilityLabel("\(headline). \(detail)")
     }
 
@@ -364,10 +672,11 @@ final class Canvas: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     private let page: URL
     private var saved: [String: String]
 
-    static var fileURL: URL {
+    static var folder: URL {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/CountdownOverlay/canvas.json")
+            .appendingPathComponent("Library/Application Support/CountdownOverlay")
     }
+    static var fileURL: URL { folder.appendingPathComponent("canvas.json") }
 
     /// make-app.sh copies the page into the bundle; a bare binary looks beside itself and in the
     /// current directory for the source checkout's copy.
@@ -385,14 +694,32 @@ final class Canvas: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
     init?(page: URL? = Canvas.pageURL) {
         guard let page = page else { return nil }
         self.page = page
-        saved = (try? Data(contentsOf: Self.fileURL))
-            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] } ?? [:]
+        saved = Self.readSaved()
         let config = WKWebViewConfiguration()
         webView = WKWebView(frame: .zero, configuration: config)
         super.init()
         config.userContentController.add(self, name: "canvas")
         webView.navigationDelegate = self
+        webView.setAccessibilityLabel("Canvas")
         load()
+    }
+
+    /// What was saved last time. A file that can't be read is set aside (never overwritten), and
+    /// a good one is copied to canvas.previous.json first, so one bad moment can't lose the canvas.
+    private static func readSaved() -> [String: String] {
+        let fm = FileManager.default
+        guard let data = try? Data(contentsOf: fileURL) else { return [:] }
+        if let saved = (try? JSONSerialization.jsonObject(with: data)) as? [String: String] {
+            let previous = folder.appendingPathComponent("canvas.previous.json")
+            try? fm.removeItem(at: previous)
+            try? fm.copyItem(at: fileURL, to: previous)
+            return saved
+        }
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let aside = folder.appendingPathComponent("canvas.unreadable-\(stamp).json")
+        try? fm.moveItem(at: fileURL, to: aside)
+        NSLog("canvas: couldn't read %@; kept it as %@", fileURL.path, aside.path)
+        return [:]
     }
 
     private func load() {
@@ -440,19 +767,24 @@ final class Canvas: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
 
 /// The canvas as an ordinary window, opened from its menu-bar icon while the screen isn't
 /// blocked (§10). Closing it only hides it: the canvas lives on in the shared web view, which
-/// moves into the overlay whenever the screen is blocked.
+/// moves into the overlay whenever the screen is blocked. Its title bar melts into the canvas.
 final class CanvasWindow: NSWindow, NSWindowDelegate {
     private let canvas: Canvas
 
     init(canvas: Canvas) {
         self.canvas = canvas
-        super.init(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 680),
+        super.init(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720),
                    styleMask: [.titled, .closable, .miniaturizable, .resizable],
                    backing: .buffered,
                    defer: false)
         title = "Canvas"
+        titlebarAppearsTransparent = true
+        backgroundColor = NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? Theme.ground : Theme.color(0xeef1ef)
+        }
+        tabbingMode = .disallowed
         isReleasedWhenClosed = false
-        minSize = NSSize(width: 480, height: 360)
+        minSize = NSSize(width: 520, height: 380)
         contentView = NSView()
         delegate = self
         center()
@@ -464,6 +796,7 @@ final class CanvasWindow: NSWindow, NSWindowDelegate {
         let web = canvas.webView
         guard let content = contentView, web.superview !== content else { return }
         web.removeFromSuperview()
+        web.appearance = nil                       // the window follows the Mac's light or dark
         web.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(web)
         NSLayoutConstraint.activate([
@@ -479,12 +812,12 @@ final class CanvasWindow: NSWindow, NSWindowDelegate {
 
 // MARK: - Overlay window (one per screen)
 
-/// What the blocked screen can show. The clock and status line underneath are set separately,
-/// every tick, without rebuilding the views.
+/// What the blocked screen can show. The clock, progress, slot and the lines of text are set
+/// separately, every tick, without rebuilding the views.
 enum OverlayContent: Equatable {
-    case confirmation(heading: String, mode: Mode, slot: Int)
+    case confirmation(heading: String, mode: Mode)
     case closed(escape: EscapeState)
-    case puzzle(question: String, note: String)
+    case puzzle(question: String, attemptsLeft: Int)
 }
 
 enum EscapeState: Equatable {
@@ -504,29 +837,35 @@ protocol OverlayActions: AnyObject {
 final class OverlayWindow: NSWindow {
     weak var actions: OverlayActions?
     private(set) var content: OverlayContent?
+    /// Another screen holds the canvas: Closed says where it is.
+    var canvasElsewhere = false
 
     private let clockLabel = NSTextField(labelWithString: "")
+    private let progress = ProgressBar(height: 6)
     private let statusLabel = NSTextField(wrappingLabelWithString: "")
+    private let noteLabel = NSTextField(wrappingLabelWithString: "")
     private let stack = NSStackView()
     private var answerField: NSTextField?
+    private var picker: NSSegmentedControl?
     private let headingSize: CGFloat
     private let textSize: CGFloat
 
     // Closed on the main screen (§10): the canvas fills it, under a strip with the clock, the
-    // status line and I need out.
+    // status line and I need out, and a hairline of progress along the strip's foot.
     private(set) var canvas: WKWebView?
     private let canvasPane = NSView()
     private let canvasBar = NSStackView()
     private let canvasClock = NSTextField(labelWithString: "")
     private let canvasStatus = NSTextField(labelWithString: "")
     private let canvasEscape = NSButton(title: "I need out", target: nil, action: nil)
+    private let canvasProgress = ProgressBar(height: 3, track: NSColor(white: 1, alpha: 0.06))
 
     init(screen: NSScreen) {
         // Use the global-coordinate initializer: the `screen:` variant interprets
         // contentRect relative to that screen, which misplaces secondary displays.
         let shortSide = min(screen.frame.width, screen.frame.height)
-        headingSize = min(max(shortSide * 0.06, 28), 64)
-        textSize = min(max(shortSide * 0.028, 18), 34)
+        headingSize = min(max(shortSide * 0.055, 28), 60)
+        textSize = min(max(shortSide * 0.024, 16), 30)
         super.init(contentRect: screen.frame,
                    styleMask: [.borderless],
                    backing: .buffered,
@@ -536,34 +875,52 @@ final class OverlayWindow: NSWindow {
         level = .screenSaver                       // above everything, incl. full-screen apps
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         isOpaque = false
-        backgroundColor = NSColor.black.withAlphaComponent(0.88)
+        backgroundColor = .clear
         hasShadow = false
         ignoresMouseEvents = false                 // swallow clicks so they don't fall through
         hidesOnDeactivate = false
         isReleasedWhenClosed = false
         isExcludedFromWindowsMenu = true
-        animationBehavior = .none                  // appear instantly, no fade
+        animationBehavior = .none
         isMovable = false
+        appearance = NSAppearance(named: .darkAqua)  // dark controls on the dark screen
+
+        let content = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        // Whatever was on screen goes out of focus under a deep shade: there, but unreadable.
+        let blur = NSVisualEffectView(frame: content.bounds)
+        blur.material = .hudWindow
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        blur.autoresizingMask = [.width, .height]
+        content.addSubview(blur)
+        let shade = NSView(frame: content.bounds)
+        shade.wantsLayer = true
+        shade.layer?.backgroundColor = Theme.ground.withAlphaComponent(0.72).cgColor
+        shade.autoresizingMask = [.width, .height]
+        content.addSubview(shade)
 
         // Scale the digits with the screen so they fit on small displays
         // and stay legible on large ones.
         let clockSize = min(max(shortSide * 0.22, 64), 260)
-        clockLabel.font = NSFont.monospacedDigitSystemFont(ofSize: clockSize, weight: .bold)
-        clockLabel.textColor = .white
+        clockLabel.font = Theme.digits(clockSize, .bold)
+        clockLabel.textColor = Theme.ink
         clockLabel.alignment = .center
         clockLabel.setAccessibilityLabel("Time left")
+        progress.widthAnchor.constraint(equalToConstant: clockSize * 2.3).isActive = true
 
-        statusLabel.font = NSFont.systemFont(ofSize: textSize, weight: .medium)
-        statusLabel.textColor = NSColor.white.withAlphaComponent(0.85)
+        statusLabel.font = Theme.rounded(textSize, .medium)
+        statusLabel.textColor = Theme.ink.withAlphaComponent(0.8)
         statusLabel.alignment = .center
         statusLabel.maximumNumberOfLines = 3
+        noteLabel.font = Theme.rounded(textSize * 0.85, .regular)
+        noteLabel.textColor = Theme.muted
+        noteLabel.alignment = .center
+        noteLabel.maximumNumberOfLines = 3
 
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = textSize
         stack.translatesAutoresizingMaskIntoConstraints = false
-
-        let content = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
         content.addSubview(stack)
         NSLayoutConstraint.activate([
             stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
@@ -571,30 +928,35 @@ final class OverlayWindow: NSWindow {
             stack.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, multiplier: 0.8),
         ])
 
-        canvasClock.font = NSFont.monospacedDigitSystemFont(ofSize: textSize * 1.3, weight: .bold)
-        canvasClock.textColor = .white
+        canvasClock.font = Theme.digits(textSize * 1.3, .bold)
+        canvasClock.textColor = Theme.ink
         canvasClock.setAccessibilityLabel("Time left")
-        canvasStatus.font = NSFont.systemFont(ofSize: textSize * 0.8, weight: .medium)
-        canvasStatus.textColor = NSColor.white.withAlphaComponent(0.85)
+        canvasStatus.font = Theme.rounded(textSize * 0.8, .medium)
+        canvasStatus.textColor = Theme.ink.withAlphaComponent(0.8)
         canvasStatus.lineBreakMode = .byTruncatingTail
         canvasStatus.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         canvasEscape.target = self
         canvasEscape.action = #selector(escapePressed)
         canvasEscape.bezelStyle = .rounded
-        canvasEscape.font = NSFont.systemFont(ofSize: textSize * 0.8)
+        canvasEscape.font = NSFont.systemFont(ofSize: textSize * 0.75, weight: .medium)
+        canvasEscape.toolTip = "Solve a small sum to pause everything for \(Config.pauseMinutes) minutes"
+        canvasProgress.tint = Theme.closed
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        for view in [canvasClock, canvasStatus, spacer, canvasEscape] as [NSView] { canvasBar.addArrangedSubview(view) }
+        let pill = Theme.pill("Closed", tint: Theme.closed, size: textSize * 0.5)
+        for view in [pill, canvasClock, canvasStatus, spacer, canvasEscape] as [NSView] { canvasBar.addArrangedSubview(view) }
         canvasBar.orientation = .horizontal
-        canvasBar.spacing = textSize
-        canvasBar.edgeInsets = NSEdgeInsets(top: 8, left: textSize, bottom: 8, right: textSize)
+        canvasBar.alignment = .centerY
+        canvasBar.spacing = textSize * 0.8
+        canvasBar.edgeInsets = NSEdgeInsets(top: 10, left: textSize, bottom: 10, right: textSize)
         canvasBar.translatesAutoresizingMaskIntoConstraints = false
         canvasPane.wantsLayer = true
         // The canvas page's own ground colour, so the strip runs into it.
-        canvasPane.layer?.backgroundColor = NSColor(srgbRed: 0.078, green: 0.098, blue: 0.09, alpha: 1).cgColor
+        canvasPane.layer?.backgroundColor = Theme.ground.cgColor
         canvasPane.translatesAutoresizingMaskIntoConstraints = false
         canvasPane.isHidden = true
         canvasPane.addSubview(canvasBar)
+        canvasPane.addSubview(canvasProgress)
         content.addSubview(canvasPane)
         NSLayoutConstraint.activate([
             canvasPane.leadingAnchor.constraint(equalTo: content.leadingAnchor),
@@ -604,6 +966,9 @@ final class OverlayWindow: NSWindow {
             canvasBar.leadingAnchor.constraint(equalTo: canvasPane.leadingAnchor),
             canvasBar.trailingAnchor.constraint(equalTo: canvasPane.trailingAnchor),
             canvasBar.topAnchor.constraint(equalTo: canvasPane.topAnchor, constant: topInset(of: screen)),
+            canvasProgress.leadingAnchor.constraint(equalTo: canvasPane.leadingAnchor),
+            canvasProgress.trailingAnchor.constraint(equalTo: canvasPane.trailingAnchor),
+            canvasProgress.topAnchor.constraint(equalTo: canvasBar.bottomAnchor),
         ])
         contentView = content
     }
@@ -614,13 +979,15 @@ final class OverlayWindow: NSWindow {
         return 0
     }
 
-    /// Hosts the canvas here (moving it from wherever it was), for Closed to show.
+    /// Hosts the canvas here (moving it from wherever it was), for Closed to show. The blocked
+    /// screen is a dark place, so the canvas goes dark with it.
     func attachCanvas(_ webView: WKWebView) {
         webView.removeFromSuperview()
+        webView.appearance = NSAppearance(named: .darkAqua)
         webView.translatesAutoresizingMaskIntoConstraints = false
         canvasPane.addSubview(webView)
         NSLayoutConstraint.activate([
-            webView.topAnchor.constraint(equalTo: canvasBar.bottomAnchor),
+            webView.topAnchor.constraint(equalTo: canvasProgress.bottomAnchor),
             webView.leadingAnchor.constraint(equalTo: canvasPane.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: canvasPane.trailingAnchor),
             webView.bottomAnchor.constraint(equalTo: canvasPane.bottomAnchor),
@@ -636,6 +1003,7 @@ final class OverlayWindow: NSWindow {
         content = new
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         answerField = nil
+        picker = nil
 
         // Closed with the canvas here: it replaces the dark screen; everything else covers it.
         if case let .closed(escape) = new, let web = canvas {
@@ -653,50 +1021,96 @@ final class OverlayWindow: NSWindow {
             makeFirstResponder(nil)
         }
 
+        styleStatus(quiet: { if case .confirmation = new { return true } else { return false } }())
         switch new {
-        case let .confirmation(heading, _, slot):
-            stack.addArrangedSubview(label(heading, size: headingSize, weight: .bold))
-            let picker = NSSegmentedControl(labels: Config.slots.map(String.init),
+        case let .confirmation(heading, mode):
+            let tint = Theme.tint(mode)
+            stack.addArrangedSubview(Theme.pill("Next · \(mode.title)", tint: tint, size: textSize * 0.6))
+            let title = label(heading, size: headingSize, weight: .bold)
+            stack.addArrangedSubview(title)
+            stack.setCustomSpacing(textSize * 0.5, after: title)
+            stack.addArrangedSubview(noteLabel)
+            stack.setCustomSpacing(textSize * 1.6, after: noteLabel)
+            let picker = NSSegmentedControl(labels: Config.slots.map { "\($0) min" },
                                             trackingMode: .selectOne,
                                             target: self, action: #selector(slotChanged(_:)))
-            picker.font = NSFont.systemFont(ofSize: textSize)
+            picker.font = Theme.rounded(textSize, .semibold)
             picker.controlSize = .large
-            picker.selectedSegment = Config.slots.firstIndex(of: slot) ?? -1
-            picker.setAccessibilityLabel("Minutes")
+            picker.segmentDistribution = .fillEqually
+            picker.widthAnchor.constraint(equalToConstant: textSize * 16).isActive = true
+            picker.setAccessibilityLabel("Length of \(mode.title)")
             stack.addArrangedSubview(picker)
-            stack.addArrangedSubview(label("minutes", size: textSize * 0.8, weight: .regular))
-            stack.addArrangedSubview(button("Start", key: "\r", action: #selector(startPressed)))
+            self.picker = picker
+            stack.setCustomSpacing(textSize * 1.4, after: picker)
+            let start = button("Start \(mode.title)", key: "\r", action: #selector(startPressed))
+            start.bezelColor = tint
+            start.widthAnchor.constraint(greaterThanOrEqualToConstant: textSize * 10).isActive = true
+            stack.addArrangedSubview(start)
+            stack.addArrangedSubview(statusLabel)
+            stack.addArrangedSubview(label("Return starts  ·  ← → or 4, 8, 6 pick the length",
+                                           size: textSize * 0.65, weight: .regular, color: Theme.faint))
 
         case let .closed(escape):
+            stack.addArrangedSubview(Theme.pill("Closed", tint: Theme.closed, size: textSize * 0.6))
             stack.addArrangedSubview(clockLabel)
+            stack.setCustomSpacing(textSize * 0.4, after: clockLabel)
+            progress.tint = Theme.closed
+            stack.addArrangedSubview(progress)
+            stack.setCustomSpacing(textSize * 1.4, after: progress)
             stack.addArrangedSubview(statusLabel)
             if escape != .hidden {
                 let out = button("I need out", key: "", action: #selector(escapePressed))
                 out.isEnabled = escape == .available
+                out.toolTip = "Solve a small sum to pause everything for \(Config.pauseMinutes) minutes"
                 stack.addArrangedSubview(out)
             }
+            if canvasElsewhere {
+                stack.addArrangedSubview(label("Your canvas is on the main screen.",
+                                               size: textSize * 0.7, weight: .regular, color: Theme.faint))
+            }
 
-        case let .puzzle(question, note):
-            stack.addArrangedSubview(clockLabel)
-            stack.addArrangedSubview(label(question, size: headingSize, weight: .bold))
+        case let .puzzle(question, attemptsLeft):
+            stack.addArrangedSubview(Theme.pill("I need out", tint: Theme.closed, size: textSize * 0.6))
+            stack.addArrangedSubview(label("Solve it to pause everything for \(Config.pauseMinutes) minutes.",
+                                           size: textSize * 0.85, weight: .regular, color: Theme.muted))
+            let q = NSTextField(labelWithString: question)
+            q.font = Theme.digits(headingSize * 1.25, .bold)
+            q.textColor = Theme.ink
+            q.alignment = .center
+            stack.addArrangedSubview(q)
             let field = NSTextField(string: "")
-            field.font = NSFont.monospacedDigitSystemFont(ofSize: headingSize * 0.8, weight: .regular)
+            field.font = Theme.digits(headingSize * 0.8, .medium)
             field.alignment = .center
             field.placeholderString = "?"
             field.setAccessibilityLabel("Answer")
             field.widthAnchor.constraint(equalToConstant: headingSize * 5).isActive = true
+            field.wantsLayer = true
             stack.addArrangedSubview(field)
             answerField = field
+            let answer = button("Answer", key: "\r", action: #selector(answerPressed))
+            answer.bezelColor = Theme.closed
             let row = NSStackView(views: [
-                button("Never mind", key: "", action: #selector(dismissPuzzlePressed)),
-                button("Answer", key: "\r", action: #selector(answerPressed)),
+                button("Never mind", key: "\u{1b}", action: #selector(dismissPuzzlePressed)),
+                answer,
             ])
             row.orientation = .horizontal
             row.spacing = textSize
             stack.addArrangedSubview(row)
-            statusLabel.stringValue = note
+            // One dot per attempt: the used ones go dim.
+            let dots = (0..<Config.puzzleAttempts).map { $0 < attemptsLeft ? "●" : "○" }.joined(separator: "  ")
+            let tries = label(dots, size: textSize * 0.7, weight: .regular,
+                              color: attemptsLeft == Config.puzzleAttempts ? Theme.faint : Theme.closed)
+            tries.setAccessibilityLabel("\(attemptsLeft) of \(Config.puzzleAttempts) attempts left")
+            stack.addArrangedSubview(tries)
             stack.addArrangedSubview(statusLabel)
+            stack.setCustomSpacing(textSize * 2, after: statusLabel)
+            stack.addArrangedSubview(clockLabel)
+            clockLabel.font = Theme.digits(headingSize * 0.9, .semibold)
+            clockLabel.textColor = Theme.muted
+            return
         }
+        clockLabel.font = Theme.digits(min(max(min(frame.width, frame.height) * 0.22, 64), 260), .bold)
+        clockLabel.textColor = Theme.ink
         stack.layoutSubtreeIfNeeded()
     }
 
@@ -708,6 +1122,25 @@ final class OverlayWindow: NSWindow {
     func setStatus(_ text: String) {
         if statusLabel.stringValue != text { statusLabel.stringValue = text }
         if canvasStatus.stringValue != text { canvasStatus.stringValue = text }
+        statusLabel.isHidden = text.isEmpty
+    }
+
+    /// The confirmation's line about what Start leads to.
+    func setNote(_ text: String) {
+        if noteLabel.stringValue != text { noteLabel.stringValue = text }
+    }
+
+    /// How much of Closed is left, 0...1.
+    func setProgress(_ fraction: Double) {
+        progress.fraction = CGFloat(fraction)
+        canvasProgress.fraction = CGFloat(fraction)
+    }
+
+    /// The slot the confirmation's picker shows.
+    func setSlot(_ minutes: Int) {
+        guard let picker = picker, let index = Config.slots.firstIndex(of: minutes),
+              picker.selectedSegment != index else { return }
+        picker.selectedSegment = index
     }
 
     /// Puts the cursor in the answer field, when the puzzle is showing.
@@ -715,19 +1148,32 @@ final class OverlayWindow: NSWindow {
         if let field = answerField { makeFirstResponder(field) }
     }
 
-    private func label(_ text: String, size: CGFloat, weight: NSFont.Weight) -> NSTextField {
-        let l = NSTextField(wrappingLabelWithString: text)
-        l.font = NSFont.systemFont(ofSize: size, weight: weight)
-        l.textColor = .white
-        l.alignment = .center
-        return l
+    /// A wrong answer: the field shakes its head.
+    func shakeAnswer() {
+        guard let layer = answerField?.layer else { return }
+        let shake = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        shake.values = [0, -14, 12, -9, 6, -3, 0]
+        shake.duration = 0.42
+        shake.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(shake, forKey: "shake")
+    }
+
+    /// The status line speaks up for reminders and the puzzle, and stays quiet on a confirmation.
+    private func styleStatus(quiet: Bool) {
+        statusLabel.font = Theme.rounded(quiet ? textSize * 0.75 : textSize, quiet ? .regular : .medium)
+        statusLabel.textColor = quiet ? Theme.muted : Theme.ink.withAlphaComponent(0.8)
+    }
+
+    private func label(_ text: String, size: CGFloat, weight: NSFont.Weight,
+                       color: NSColor = Theme.ink) -> NSTextField {
+        Theme.label(text, font: Theme.rounded(size, weight), color: color)
     }
 
     private func button(_ title: String, key: String, action: Selector) -> NSButton {
         let b = NSButton(title: title, target: self, action: action)
         b.bezelStyle = .rounded
         b.controlSize = .large
-        b.font = NSFont.systemFont(ofSize: textSize)
+        b.font = NSFont.systemFont(ofSize: textSize * 0.9, weight: .medium)
         b.keyEquivalent = key
         return b
     }
@@ -747,15 +1193,30 @@ final class OverlayWindow: NSWindow {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 
-    // Keys that no control claims go nowhere: the window itself swallows them.
-    override func keyDown(with event: NSEvent) {}
+    /// Keys that no control claims go nowhere: the window itself swallows them. On a
+    /// confirmation, the arrows and 4 / 8 / 6 (for 16) pick the length.
+    override func keyDown(with event: NSEvent) {
+        guard case .confirmation = content, let picker = picker, !event.isARepeat || event.keyCode == 123 || event.keyCode == 124 else { return }
+        var index = picker.selectedSegment
+        switch (event.keyCode, event.charactersIgnoringModifiers ?? "") {
+        case (123, _): index = max(0, index - 1)                               // ←
+        case (124, _): index = min(Config.slots.count - 1, index + 1)          // →
+        case (_, "4"): index = 0
+        case (_, "8"): index = 1
+        case (_, "6"), (_, "1"): index = 2
+        default: return
+        }
+        guard index != picker.selectedSegment, Config.slots.indices.contains(index) else { return }
+        picker.selectedSegment = index
+        actions?.overlayChoseSlot(Config.slots[index])
+    }
     override func keyUp(with event: NSEvent) {}
     override func flagsChanged(with event: NSEvent) {}
     override func cancelOperation(_ sender: Any?) {}
     override func performClose(_ sender: Any?) {}  // Cmd-W from the main menu: not here
 
     /// Return still reaches the Start / Answer buttons and the canvas gets its shortcuts; the
-    /// Edit menu (cut, copy, paste, select all) comes next; any other Cmd-combination
+    /// Edit menu (undo, cut, copy, paste, select all) comes next; any other Cmd-combination
     /// (Cmd-W, Cmd-Q, Cmd-H…) stops here.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         if super.performKeyEquivalent(with: event) { return true }
@@ -1153,6 +1614,74 @@ final class Updater {
 }
 
 
+
+// MARK: - Menu header
+
+/// The top of the timer's menu: what's happening, how long is left, and how far along it is,
+/// kept live while the menu is open.
+final class MenuHeader: NSView {
+    private let stack = NSStackView()
+    private var pill: NSView?
+    private var pillKey = ""
+    private let time = NSTextField(labelWithString: "")
+    private let bar = ProgressBar(height: 4, track: NSColor.labelColor.withAlphaComponent(0.1))
+    private let detail = NSTextField(wrappingLabelWithString: "")
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 150))
+        time.font = Theme.digits(30, .bold)
+        time.textColor = .labelColor
+        detail.font = NSFont.systemFont(ofSize: 11.5)
+        detail.textColor = .secondaryLabelColor
+        detail.maximumNumberOfLines = 3
+        detail.preferredMaxLayoutWidth = 268
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 10, right: 16)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for view in [time, bar, detail] as [NSView] { stack.addArrangedSubview(view) }
+        stack.setCustomSpacing(8, after: bar)
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            bar.widthAnchor.constraint(equalToConstant: 268),
+            detail.widthAnchor.constraint(equalToConstant: 268),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    func update(pill text: String, tint: NSColor, time value: String, fraction: Double?, detail line: String) {
+        let key = text + tint.description
+        if key != pillKey {
+            pillKey = key
+            pill?.removeFromSuperview()
+            // Held at its leading edge only, so the stack can't stretch it across the menu.
+            let new = Theme.pill(text, tint: tint, size: 9.5)
+            let holder = NSView()
+            holder.translatesAutoresizingMaskIntoConstraints = false
+            holder.addSubview(new)
+            NSLayoutConstraint.activate([
+                new.leadingAnchor.constraint(equalTo: holder.leadingAnchor),
+                new.topAnchor.constraint(equalTo: holder.topAnchor),
+                new.bottomAnchor.constraint(equalTo: holder.bottomAnchor),
+                new.trailingAnchor.constraint(lessThanOrEqualTo: holder.trailingAnchor),
+            ])
+            stack.insertArrangedSubview(holder, at: 0)
+            pill = holder
+        }
+        if time.stringValue != value { time.stringValue = value }
+        bar.alphaValue = fraction == nil ? 0 : 1
+        bar.tint = tint
+        bar.fraction = CGFloat(fraction ?? 0)
+        if detail.stringValue != line { detail.stringValue = line }
+        setAccessibilityLabel("\(text). \(value). \(line)")
+    }
+}
+
 // MARK: - App delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, OverlayActions {
@@ -1166,6 +1695,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
+    private let menuHeader = MenuHeader()
+    private var menuIsOpen = false
     private var overlays: [OverlayWindow] = []
     private var timer: Timer?
     private var keyMonitor: Any?
@@ -1196,16 +1727,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)      // no Dock icon, menubar only
+        if let dir = UserDefaults.standard.string(forKey: "preview"), !dir.isEmpty {
+            runPreviews(into: URL(fileURLWithPath: dir))
+            return
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            if let image = NSImage(systemSymbolName: "timer", accessibilityDescription: "Session timer") {
-                image.isTemplate = true
-                button.image = image
-                button.imagePosition = .imageLeading
-            } else {
-                button.title = "⏱"                 // fallback if SF Symbols are unavailable
-            }
+            button.imagePosition = .imageLeading
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.menuBarFont(ofSize: 0).pointSize,
+                                                           weight: .regular)
         }
         menu.delegate = self
         menu.autoenablesItems = false              // honour the isEnabled flags set in menuNeedsUpdate
@@ -1218,6 +1749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
         updater.onChange = { [weak self] _ in self?.updateStatusItem() }
         updater.start()
+        registerLoginItemOnce()
 
         let center = NotificationCenter.default
         center.addObserver(self,
@@ -1240,11 +1772,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
                                                           object: nil)
 
         // §8: killed or restarted mid-session → the interrupted mode's confirmation, full slot.
+        // A session whose time ran out while the app wasn't running just ends, quietly.
         if let end = Store.sessionEnd, let mode = Store.interruptedMode {
-            sessionEnd = end
-            firstConfirmation = false
-            startTicking()
-            reachConfirmation(for: mode)
+            if Date() >= end {
+                Store.clearSession()
+            } else {
+                sessionEnd = end
+                firstConfirmation = false
+                startTicking()
+                reachConfirmation(for: mode)
+            }
         }
     }
 
@@ -1292,6 +1829,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         NSApp.mainMenu = main
     }
 
+    // MARK: Previews
+
+    /// `-preview DIR` draws the blocked screens, a pop-up, the menu's header and the menu-bar
+    /// icons into PNGs in DIR, then quits. CI runs it, so every build leaves pictures of its UI.
+    /// Nothing about a real session is touched: it plays muted and stores nothing it keeps.
+    private func runPreviews(into dir: URL) {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        UserDefaults.standard.set(true, forKey: "mute")
+        func save(_ view: NSView?, _ name: String) {
+            guard let view = view else { return }
+            view.layoutSubtreeIfNeeded()
+            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: dir.appendingPathComponent(name + ".png"))
+        }
+        var steps: [() -> Void] = [
+            {
+                self.sessionEnd = Date().addingTimeInterval(Config.seconds(minutes: 90))
+                self.firstConfirmation = false
+                self.reachConfirmation(for: .closed)
+            },
+            { save(self.overlays.first?.contentView, "1-confirmation") },
+            {
+                Store.closedRounds = 2
+                self.begin(.closed)
+                self.remind(.closed, minutes: 2)
+                self.render()
+            },
+            {
+                save(self.overlays.first?.contentView, "2-closed")
+                Popup.shared.show("02:00", "left in Closed. Then the screen opens again.",
+                                  symbol: "bell.fill", tint: Theme.closed)
+            },
+            {
+                save(NSApp.windows.first { $0 is PopupPanel }?.contentView, "3-popup")
+                self.puzzle = Puzzle(question: "23 × 7 = ?", answer: 161)
+                self.render()
+            },
+            { save(self.overlays.first?.contentView, "4-puzzle") },
+            {
+                self.overlayAnswered("150")
+            },
+            {
+                save(self.overlays.first?.contentView, "5-puzzle-wrong")
+                self.puzzle = nil
+                self.canvas = Canvas()
+                self.buildOverlays()
+                self.render()
+            },
+            {
+                save(self.overlays.first?.contentView, "8-closed-with-canvas")
+                for (name, appearance) in [("6-menu-dark", NSAppearance.Name.darkAqua), ("6-menu-light", .aqua)] {
+                    self.menuHeader.appearance = NSAppearance(named: appearance)
+                    self.refreshMenuHeader()
+                    let backdrop = NSView(frame: self.menuHeader.frame)
+                    backdrop.appearance = NSAppearance(named: appearance)
+                    backdrop.wantsLayer = true
+                    backdrop.layer?.backgroundColor = (appearance == .darkAqua ? NSColor(white: 0.16, alpha: 1)
+                                                                               : NSColor(white: 0.96, alpha: 1)).cgColor
+                    backdrop.addSubview(self.menuHeader)
+                    save(backdrop, name)
+                    self.menuHeader.removeFromSuperview()
+                }
+                let kinds: [StatusIcon.Kind] = [.idle, .ready, .left(48), .left(36), .left(24), .left(12), .left(3), .paused]
+                let strip = NSView(frame: NSRect(x: 0, y: 0, width: kinds.count * 40 + 8, height: 40))
+                strip.wantsLayer = true
+                strip.layer?.backgroundColor = NSColor.white.cgColor
+                for (i, kind) in kinds.enumerated() {
+                    let image = StatusIcon.image(kind).copy() as! NSImage
+                    image.isTemplate = false
+                    let view = NSImageView(frame: NSRect(x: 8 + i * 40, y: 4, width: 32, height: 32))
+                    view.image = image
+                    view.imageScaling = .scaleProportionallyUpOrDown
+                    strip.addSubview(view)
+                }
+                save(strip, "7-menu-bar-icons")
+                Store.clearSession()
+                UserDefaults.standard.removeObject(forKey: "mute")
+                exit(0)
+            },
+        ]
+        func next() {
+            guard !steps.isEmpty else { return }
+            steps.removeFirst()()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { next() }
+        }
+        next()
+    }
+
+    // MARK: Open at Login
+
+    /// §8 can only reopen a session after a restart if the app opens at login, so an installed
+    /// copy asks for that once, the first time it runs. The menu turns it off again.
+    private func registerLoginItemOnce() {
+        guard #available(macOS 13.0, *), Updater.isInstalledApp,
+              !UserDefaults.standard.bool(forKey: "loginItem.offered") else { return }
+        UserDefaults.standard.set(true, forKey: "loginItem.offered")
+        do {
+            try SMAppService.mainApp.register()
+        } catch {
+            NSLog("login item: %@", error.localizedDescription)
+        }
+    }
+
+    @objc private func toggleLoginItem() {
+        guard #available(macOS 13.0, *) else { return }
+        let service = SMAppService.mainApp
+        do {
+            switch service.status {
+            case .enabled: try service.unregister()
+            case .requiresApproval: SMAppService.openSystemSettingsLoginItems()
+            default: try service.register()
+            }
+        } catch {
+            NSLog("login item: %@", error.localizedDescription)
+            SMAppService.openSystemSettingsLoginItems()
+        }
+    }
+
     // MARK: Canvas window (§10)
 
     private func addCanvasStatusItem() {
@@ -1303,7 +1959,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
             } else {
                 button.title = "✦"                 // fallback if SF Symbols are unavailable
             }
-            button.toolTip = "Canvas"
+            button.toolTip = "Canvas — your surfaces, any time"
             button.target = self
             button.action = #selector(toggleCanvas)
         }
@@ -1338,73 +1994,188 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     // MARK: Menubar
 
+    /// The icon's pie is the time left in the mode; the digits beside it say how much.
     private func updateStatusItem() {
         guard let button = statusItem?.button else { return }
-        let title: String
+        let kind: StatusIcon.Kind
+        var title = ""
+        var tip: String
         switch phase {
-        case .idle: title = ""
-        case .confirming: title = "Ready?"
-        case let .running(mode, deadline): title = "\(mode.title) \(Config.clock(deadline.timeIntervalSinceNow))"
-        case let .paused(until): title = "Paused \(Config.clock(until.timeIntervalSinceNow))"
+        case .idle:
+            kind = .idle
+            tip = "No session running — click to start one"
+        case let .confirming(mode):
+            kind = .ready
+            tip = "Waiting for Start (\(mode.title))"
+        case let .running(mode, deadline):
+            let left = deadline.timeIntervalSinceNow
+            kind = StatusIcon.kind(left: left / Config.seconds(minutes: slots[mode]!))
+            title = Config.clock(left)
+            tip = "\(mode.title) — \(title) left"
+        case let .paused(until):
+            let left = until.timeIntervalSinceNow
+            kind = .paused
+            title = Config.clock(left)
+            tip = "Paused — \(title) until Closed restarts"
         }
+        let image = StatusIcon.image(kind)
+        if button.image !== image { button.image = image }
         if button.title != title { button.title = title }
-        if case .available = updater.state {
-            button.toolTip = "Update available — see the menu"
-        } else {
-            button.toolTip = inSession ? "Session running" : "Click to start a session"
+        if case .available = updater.state { tip += " · An update is ready in the menu" }
+        if button.toolTip != tip {
+            button.toolTip = tip
+            button.setAccessibilityLabel(tip)
         }
+        if menuIsOpen { refreshMenuHeader() }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) { menuIsOpen = true }
+    func menuDidClose(_ menu: NSMenu) { menuIsOpen = false }
+
+    /// "Session ends after 3:42 PM · 1 h 12 min to go · 2 Closed rounds so far".
+    private func sessionLine() -> String {
+        guard let end = sessionEnd else { return "" }
+        let left = end.timeIntervalSinceNow
+        var line = left > 0
+            ? "Session ends after \(Config.wallTime(in: left)) · \(Config.duration(left)) to go"
+            : "Session ends at the next confirmation"
+        let rounds = Store.closedRounds
+        if rounds > 0 { line += "\n\(rounds) Closed \(rounds == 1 ? "round" : "rounds") so far, \(Store.closedMinutes) min in all" }
+        return line
+    }
+
+    private func refreshMenuHeader() {
+        switch phase {
+        case .idle:
+            menuHeader.update(pill: "No session", tint: Theme.muted, time: "Ready when you are",
+                              fraction: nil,
+                              detail: "Opened \(slots[.opened]!) min ⇄ Closed \(slots[.closed]!) min. Pick a length below to begin.")
+        case let .confirming(mode):
+            menuHeader.update(pill: "Next · \(mode.title)", tint: Theme.tint(mode), time: "Waiting",
+                              fraction: nil, detail: "Press Start on the screen to begin \(mode.title).")
+        case let .running(mode, deadline):
+            let left = deadline.timeIntervalSinceNow
+            menuHeader.update(pill: mode.title, tint: Theme.tint(mode), time: Config.clock(left),
+                              fraction: left / Config.seconds(minutes: slots[mode]!), detail: sessionLine())
+        case let .paused(until):
+            let left = until.timeIntervalSinceNow
+            menuHeader.update(pill: "Paused", tint: Theme.muted, time: Config.clock(left),
+                              fraction: left / Config.seconds(minutes: Config.pauseMinutes),
+                              detail: "Then Closed starts over with its full \(slots[.closed]!) minutes.")
+        }
+    }
+
+    private func symbol(_ name: String) -> NSImage? {
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        image?.isTemplate = true
+        return image
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        let status: String
-        switch phase {
-        case .idle: status = "No session"
-        case let .confirming(mode): status = "Waiting for Start (\(mode.title), \(slots[mode]!) min)"
-        case let .running(mode, deadline): status = "\(mode.title): \(Config.clock(deadline.timeIntervalSinceNow)) left"
-        case let .paused(until): status = "Paused: \(Config.clock(until.timeIntervalSinceNow)) left"
-        }
-        let title = menu.addItem(withTitle: status, action: nil, keyEquivalent: "")
-        title.isEnabled = false
-        if let end = sessionEnd {
-            let ends = menu.addItem(withTitle: "Session ends after \(Config.clock(end.timeIntervalSinceNow))",
-                                    action: nil, keyEquivalent: "")
-            ends.isEnabled = false
-        }
+        let head = NSMenuItem()
+        head.view = menuHeader
+        menu.addItem(head)
+        refreshMenuHeader()
         menu.addItem(.separator())
 
         // Not while an update installs: it ends in a restart, which a session would refuse.
         let canStart = !inSession && !updater.isInstalling
-        let start = menu.addItem(withTitle: "Start Session", action: nil, keyEquivalent: "")
+        let start = menu.addItem(withTitle: inSession ? "Session Running" : "Start Session",
+                                 action: nil, keyEquivalent: "")
+        start.image = symbol("play.circle")
         start.isEnabled = canStart
         let lengths = NSMenu()
         lengths.autoenablesItems = false
         for minutes in Config.sessionMinutes {
-            let item = lengths.addItem(withTitle: Config.sessionTitle(minutes: minutes),
-                                       action: #selector(startSession(_:)), keyEquivalent: "")
+            let title = minutes < 60 ? "\(Config.sessionTitle(minutes: minutes)) — try it out"
+                                     : Config.sessionTitle(minutes: minutes)
+            let item = lengths.addItem(withTitle: title, action: #selector(startSession(_:)), keyEquivalent: "")
             item.target = self
             item.tag = minutes
             item.isEnabled = canStart
+            if minutes < 60 {
+                item.toolTip = "With 4-minute slots: Opened, Closed, and Opened again"
+                lengths.addItem(.separator())
+            }
         }
         start.submenu = lengths
 
-        menu.addItem(.separator())
-        addUpdateItems(to: menu)
-
         if canvas != nil {
-            menu.addItem(.separator())
             let open = menu.addItem(withTitle: "Open Canvas", action: #selector(openCanvas), keyEquivalent: "")
+            open.image = symbol("square.and.pencil")
             open.target = self
             open.isEnabled = !isBlocked
         }
 
         menu.addItem(.separator())
-        let quit = menu.addItem(withTitle: "Quit",
+        addSoundItems(to: menu)
+        if #available(macOS 13.0, *) {
+            let status = SMAppService.mainApp.status
+            let login = menu.addItem(withTitle: status == .requiresApproval ? "Open at Login (Approve in Settings…)"
+                                                                            : "Open at Login",
+                                     action: #selector(toggleLoginItem), keyEquivalent: "")
+            login.image = symbol("power")
+            login.target = self
+            login.state = status == .enabled ? .on : .off
+            login.toolTip = "So a session survives a restart: the app reopens right where it was."
+        }
+
+        menu.addItem(.separator())
+        addUpdateItems(to: menu)
+
+        menu.addItem(.separator())
+        let quit = menu.addItem(withTitle: inSession ? "Quit (after the session)" : "Quit CountdownOverlay",
                                 action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         quit.isEnabled = !inSession
     }
+
+    // MARK: Sound
+
+    private func addSoundItems(to menu: NSMenu) {
+        let sound = menu.addItem(withTitle: "Sound", action: nil, keyEquivalent: "")
+        sound.image = symbol(Config.muted ? "speaker.slash" : "speaker.wave.2")
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        let on = sub.addItem(withTitle: "Play Sounds", action: #selector(toggleSound), keyEquivalent: "")
+        on.target = self
+        on.state = Config.muted ? .off : .on
+        sub.addItem(.separator())
+        let heading = sub.addItem(withTitle: "Loudness", action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        let boost = Config.soundBoost
+        // The nearest choice wins the check mark, so a hand-set value still shows one.
+        let nearest = Config.loudness.indices.min { abs(Config.loudness[$0].boost - boost) < abs(Config.loudness[$1].boost - boost) }
+        for (i, level) in Config.loudness.enumerated() {
+            let item = sub.addItem(withTitle: level.title, action: #selector(setLoudness(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+            item.indentationLevel = 1
+            item.state = i == nearest ? .on : .off
+            item.isEnabled = !Config.muted
+        }
+        sub.addItem(.separator())
+        let sample = sub.addItem(withTitle: "Play a Sample", action: #selector(playSample), keyEquivalent: "")
+        sample.target = self
+        sample.isEnabled = !Config.muted
+        sound.submenu = sub
+    }
+
+    @objc private func toggleSound() {
+        UserDefaults.standard.set(!Config.muted, forKey: "mute")
+        if !Config.muted { Sound.reminder.play() }
+    }
+
+    @objc private func setLoudness(_ sender: NSMenuItem) {
+        guard Config.loudness.indices.contains(sender.tag) else { return }
+        UserDefaults.standard.set(Config.loudness[sender.tag].boost, forKey: "soundBoost")
+        SoundPlayer.shared.updateBoost()
+        Sound.reminder.play()                      // hear what you picked
+    }
+
+    @objc private func playSample() { Sound.reminder.play() }
 
     // MARK: Updates
 
@@ -1414,18 +2185,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         guard Updater.isInstalledApp else { return }
 
         @discardableResult
-        func item(_ title: String, _ action: Selector?, enabled: Bool = true) -> NSMenuItem {
+        func item(_ title: String, _ action: Selector?, enabled: Bool = true, image: String? = nil) -> NSMenuItem {
             let i = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
             i.target = self
             i.isEnabled = enabled
+            if let image = image { i.image = symbol(image) }
             return i
         }
 
         switch updater.state {
         case .idle, .upToDate:
-            item("Check for Updates…", #selector(checkForUpdates))
+            item("Check for Updates…", #selector(checkForUpdates), image: "arrow.triangle.2.circlepath")
         case .checking:
-            item("Checking for Updates…", nil, enabled: false)
+            item("Checking for Updates…", nil, enabled: false, image: "arrow.triangle.2.circlepath")
         case .available(let plan):
             let title: String
             switch plan {
@@ -1434,14 +2206,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
             case .upToDate: title = "Check for Updates…"
             }
             // Updating restarts the app, which a session refuses: offer it only in between.
-            let update = item(title, #selector(installUpdate), enabled: !inSession)
+            let update = item(inSession ? "\(title) (after the session)" : title, #selector(installUpdate),
+                              enabled: !inSession, image: "arrow.down.circle.fill")
             update.toolTip = "Downloads the new version (or builds it on this Mac when GitHub hasn't), then restarts."
         case .installing(let step):
-            item(step, nil, enabled: false)
+            item(step, nil, enabled: false, image: "arrow.down.circle")
         case .failed(let message):
-            item(message, nil, enabled: false)
+            item(message, nil, enabled: false, image: "exclamationmark.triangle")
             item("Copy Update Details", #selector(copyUpdateDetails))
-            item("Check for Updates…", #selector(checkForUpdates))
+            item("Check for Updates…", #selector(checkForUpdates), image: "arrow.triangle.2.circlepath")
         }
     }
 
@@ -1463,6 +2236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     @objc private func startSession(_ sender: NSMenuItem) {
         guard !inSession, !updater.isInstalling, Config.sessionMinutes.contains(sender.tag) else { return }
+        Store.clearSession()
         sessionEnd = Date().addingTimeInterval(Config.seconds(minutes: sender.tag))
         Store.sessionEnd = sessionEnd
         firstConfirmation = true
@@ -1483,10 +2257,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         reminderText = ""
         block()
         render()
+        updateStatusItem()
         Sound.confirmation.play()
     }
 
     private func endSession() {
+        let rounds = Store.closedRounds, minutes = Store.closedMinutes
         phase = .idle
         sessionEnd = nil
         Store.clearSession()
@@ -1495,7 +2271,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         unblock()
         updateStatusItem()
         Sound.sessionOver.play()
-        Popup.shared.show("Session over", "The session length has elapsed.", for: 10)
+        let tally = rounds == 0 ? "That's the whole session."
+            : "\(rounds) Closed \(rounds == 1 ? "round" : "rounds") · \(minutes) minutes with the screen closed."
+        Popup.shared.show("Session over", tally, symbol: "checkmark.seal.fill", tint: Theme.opened, for: 10)
     }
 
     private func begin(_ mode: Mode) {
@@ -1510,7 +2288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         case .opened:
             unblock()
             Sound.opened.play()
-            Popup.shared.show("Opened", "\(Config.clock(minutes: slot)) until Closed")
+            Popup.shared.show("Opened", "The screen is yours for \(slot) minutes, until \(Config.wallTime(in: Config.seconds(minutes: slot))).",
+                              symbol: "lock.open.fill", tint: Theme.opened)
         case .closed:
             block()
             render()
@@ -1525,7 +2304,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         puzzle = nil
         unblock()
         Sound.escaped.play()
-        Popup.shared.show("Paused", "\(Config.clock(minutes: Config.pauseMinutes)) until Closed restarts")
+        Popup.shared.show("Paused", "Everything stops for \(Config.pauseMinutes) minutes, until \(Config.wallTime(in: Config.seconds(minutes: Config.pauseMinutes))). Then Closed starts over.",
+                          symbol: "pause.circle.fill", tint: Theme.muted)
         updateStatusItem()
     }
 
@@ -1534,7 +2314,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     private func startTicking() {
         guard timer == nil else { return }
         // Tick often and derive everything from deadlines, so nothing drifts and the state
-        // recovers correctly after the machine sleeps.
+        // recovers correctly after the machine sleeps. Common modes: it keeps ticking while a
+        // menu is open.
         let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.tick() }
         t.tolerance = 0.02
         RunLoop.main.add(t, forMode: .common)
@@ -1548,11 +2329,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     private func tick() {
         switch phase {
-        case .idle, .confirming:
-            break                                  // frozen
+        case .idle:
+            break
+        case .confirming:
+            render()                               // frozen; only the "until" times move on
+            return
         case let .running(mode, deadline):
             let left = deadline.timeIntervalSinceNow
             if left <= 0 {
+                if mode == .closed {
+                    Store.closedRounds += 1
+                    Store.closedMinutes += slots[.closed]!
+                }
                 reachConfirmation(for: mode.other)
                 return
             }
@@ -1583,7 +2371,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
     private func remind(_ mode: Mode, minutes: Int) {
         let left = Config.clock(minutes: minutes)
         Sound.reminder.play()
-        Popup.shared.show(left, "left in \(mode.title)")
+        let next = mode == .opened ? "Closed comes next." : "Then the screen opens again."
+        Popup.shared.show(left, "left in \(mode.title). \(next)", symbol: "bell.fill", tint: Theme.tint(mode))
         if mode == .closed { reminderText = "\(left) left" }
     }
 
@@ -1606,8 +2395,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     func overlayAnswered(_ text: String) {
         guard case .running(.closed, _) = phase, var p = puzzle else { return }
-        let answer = Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
-        if answer == p.answer {
+        let typed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !typed.isEmpty else { return }       // Return on an empty field isn't an attempt
+        if Int(typed) == p.answer {
             lastEscape = Date()
             Store.lastEscape = lastEscape
             startPause()
@@ -1618,13 +2408,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         if p.attemptsLeft <= 0 {
             puzzle = nil
             escapeLockedUntil = Date().addingTimeInterval(Config.seconds(minutes: Config.lockoutMinutes))
+            render()
         } else {
             puzzle = p
+            render()
+            DispatchQueue.main.async { [weak self] in self?.overlays.forEach { $0.shakeAnswer() } }
         }
-        render()
     }
 
     func overlayDismissedPuzzle() {
+        guard puzzle != nil else { return }
         puzzle = nil
         render()
     }
@@ -1645,29 +2438,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
 
     // MARK: Blocked screen
 
-    /// What the overlays should show for the current phase, and the live clock and status line.
+    /// What a confirmation says about the session: how long it has left, or that this is the
+    /// last round.
+    private func sessionNote(after length: TimeInterval) -> String {
+        guard let end = sessionEnd else { return "" }
+        let left = end.timeIntervalSinceNow
+        if left <= length { return "Last round: the session ends at the confirmation after it." }
+        return "Session ends after \(Config.wallTime(in: left)) · \(Config.duration(left)) to go."
+    }
+
+    /// What the overlays should show for the current phase, and the live clock and lines of text.
     private func render() {
         guard isBlocked else { return }
         let content: OverlayContent
         var clock = ""
         var status = ""
+        var note = ""
+        var fraction = 1.0
         switch phase {
         case let .confirming(mode):
+            let slot = slots[mode]!
+            let length = Config.seconds(minutes: slot)
             let heading = firstConfirmation ? "Ready to start?" : "Ready to switch to \(mode.title)?"
-            content = .confirmation(heading: heading, mode: mode, slot: slots[mode]!)
+            content = .confirmation(heading: heading, mode: mode)
+            let until = Config.wallTime(in: length)
+            note = mode == .closed
+                ? "Every screen closes for \(slot) minutes, until \(until). Your canvas comes along."
+                : "The screen is yours for \(slot) minutes, until \(until)."
+            status = sessionNote(after: length)
         case let .running(.closed, deadline):
-            clock = Config.clock(deadline.timeIntervalSinceNow)
+            let left = deadline.timeIntervalSinceNow
+            clock = Config.clock(left)
+            fraction = left / Config.seconds(minutes: slots[.closed]!)
             if let p = puzzle {
-                let attempts = p.attemptsLeft == Config.puzzleAttempts ? ""
+                content = .puzzle(question: p.question, attemptsLeft: p.attemptsLeft)
+                status = p.attemptsLeft == Config.puzzleAttempts ? ""
                     : "Not quite. \(p.attemptsLeft) \(p.attemptsLeft == 1 ? "attempt" : "attempts") left."
-                content = .puzzle(question: p.question, note: attempts)
-                status = attempts
             } else {
                 content = .closed(escape: escapeState)
                 if let until = escapeLockedUntil, Date() < until {
                     status = "Three wrong answers. I need out is back in \(Config.clock(until.timeIntervalSinceNow))."
-                } else {
+                } else if !reminderText.isEmpty {
                     status = reminderText
+                } else {
+                    status = "The screen opens again at \(Config.wallTime(in: left))."
                 }
             }
         default:
@@ -1678,6 +2492,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
             overlay.show(content)
             overlay.setClock(clock)
             overlay.setStatus(status)
+            overlay.setNote(note)
+            overlay.setProgress(fraction)
+            if case let .confirming(mode) = phase { overlay.setSlot(slots[mode]!) }
         }
         if focusAnswer { overlays.first?.focusAnswer() }
     }
@@ -1688,7 +2505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         // The canvas's window steps aside: the overlay takes the canvas, and nothing closes it there.
         canvasWindowWasOpen = canvasWindow?.isVisible ?? false
         canvasWindow?.orderOut(nil)
-        buildOverlays()
+        buildOverlays(fadeIn: true)
         regainFocus()
         // Keys for anything but our own windows go nowhere; the overlay windows decide the rest.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { event in
@@ -1728,16 +2545,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
         overlays.removeAll()
     }
 
-    private func buildOverlays() {
+    /// One overlay per screen. Blocking fades them in (a quarter of a second, already opaque
+    /// enough to cover at once); a rebuild after a display change swaps them in place.
+    private func buildOverlays(fadeIn: Bool = false) {
         closeOverlays()
         overlays = NSScreen.screens.map { screen in
             let w = OverlayWindow(screen: screen)
             w.actions = self
+            if fadeIn { w.alphaValue = 0 }
             w.orderFrontRegardless()
             return w
         }
         // §10: the main screen (the first one, with the menu bar) holds the canvas.
-        if let canvas = canvas { overlays.first?.attachCanvas(canvas.webView) }
+        if let canvas = canvas {
+            overlays.first?.attachCanvas(canvas.webView)
+            overlays.dropFirst().forEach { $0.canvasElsewhere = true }
+        }
+        if fadeIn {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                overlays.forEach { $0.animator().alphaValue = 1 }
+            }
+        }
     }
 
     /// Keeps an overlay key and the app active for as long as the screen is blocked, so key

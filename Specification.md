@@ -24,8 +24,10 @@ Shown before every mode change, including the first mode of a session. The timer
 
 **Content**
 - Heading: *"Ready to switch to Closed?"* / *"Ready to switch to Opened?"* (first time: *"Ready to start?"*)
-- Slot selector for the mode about to start: `4` `8` `16`, current value highlighted.
-- One button: **Start**.
+- What Start leads to, and until when ("Every screen closes for 4 minutes, until 3:46 PM").
+- Slot selector for the mode about to start: `4` `8` `16`, current value highlighted. ← → and the keys 4, 8 and 6 (for 16) change it.
+- One button: **Start** (Return).
+- How long the session has left, or that this is its last round.
 
 **Behavior**
 - There is no decline option. The only way forward is Start.
@@ -48,7 +50,8 @@ In both modes, a reminder states the time remaining. Reminders fire at halving i
 | 8 | 4:00, 2:00, 1:00 |
 | 4 | 2:00, 1:00 |
 
-- In both modes, a pop-up in the middle of every screen, above everything (the blocked screen included), with the time left and the mode. It never takes the keyboard and goes away by itself after a few seconds, or at a click. Closed also keeps the reminder in the strip on the blocked screen.
+- In both modes, a pop-up in the middle of every screen, above everything (the blocked screen included), with the time left, the mode and what comes next. It never takes the keyboard, counts its seconds down along its foot and goes away by itself after a few seconds, or at a click; VoiceOver reads it out. Closed also keeps the reminder in the strip on the blocked screen.
+- The start of Opened, a pause and the end of the session pop up the same way. The last one tallies the session's Closed rounds.
 - Reminders are informational only; they contain no controls and no puzzle.
 
 ## 6. Escape puzzle (Closed mode only)
@@ -91,6 +94,7 @@ A short system sound marks every transition point, so the user hears a change wi
 
 - Sounds are the macOS system sounds of those names; a missing one is simply silent.
 - They play louder than the system plays them: 18 dB of gain followed by a peak limiter, so they don't distort (`soundBoost`, 0–24 dB). The reminder (Tink) and the solved puzzle (Pop) play three times in a row, since one is too short to notice.
+- The menu's **Sound** turns them on or off and picks the loudness: as macOS plays them (0 dB), Loud (12), Louder (18, the default) or Loudest (24).
 - Sounds are informational only and never replace the confirmation or a reminder's text.
 - Launching with `-mute YES` silences all of them.
 
@@ -100,7 +104,10 @@ What blocks the screen in Closed is a canvas the user writes on (`Canvas.html`).
 
 - The canvas is infinite: drag empty space or scroll to move around, pinch or ⌘-scroll to zoom.
 - On it are surfaces, written on directly (no separate edit mode). A surface can be dragged by its edge or its strip, resized from its corner, given one of twelve colours (or none), and deleted (a surface with text asks for a second click, and can be brought back for a few seconds after).
-- Double-clicking empty space starts a surface there; one left empty and untouched goes away again when you click elsewhere.
+- Double-clicking empty space (or N) starts a surface there; one left empty and untouched goes away again when you click elsewhere, leaving nothing to undo.
+- A surface's menu sets its colour and text size (13, 15, 19 or 26 pt), duplicates it and fits it to its text. ⌥-dragging copies it.
+- Every change can be undone and redone (⌘Z / ⇧⌘Z); a visit's typing is one step.
+- When every surface is out of view, a prompt offers to show them all.
 - When the screen isn't blocked, the canvas icon (or **Open Canvas** in the timer's menu) opens it in an ordinary window, which the user can close at any time. Clicking the icon again closes it.
 - When the screen is blocked, the canvas moves into the overlay and cannot be closed; an open window steps aside and comes back when the block ends.
 
