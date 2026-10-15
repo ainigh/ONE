@@ -374,6 +374,7 @@ enum Theme {
             label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: size * 0.9),
             label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -size * 0.75),
         ])
+        pill.setContentHuggingPriority(.required, for: .horizontal)
         pill.setAccessibilityElement(true)
         pill.setAccessibilityRole(.staticText)
         pill.setAccessibilityLabel(text)
@@ -1017,6 +1018,7 @@ final class OverlayWindow: NSWindow {
             makeFirstResponder(nil)
         }
 
+        styleStatus(quiet: { if case .confirmation = new { return true } else { return false } }())
         switch new {
         case let .confirmation(heading, mode):
             let tint = Theme.tint(mode)
@@ -1082,9 +1084,11 @@ final class OverlayWindow: NSWindow {
             field.wantsLayer = true
             stack.addArrangedSubview(field)
             answerField = field
+            let answer = button("Answer", key: "\r", action: #selector(answerPressed))
+            answer.bezelColor = Theme.closed
             let row = NSStackView(views: [
                 button("Never mind", key: "\u{1b}", action: #selector(dismissPuzzlePressed)),
-                button("Answer", key: "\r", action: #selector(answerPressed)),
+                answer,
             ])
             row.orientation = .horizontal
             row.spacing = textSize
@@ -1149,6 +1153,12 @@ final class OverlayWindow: NSWindow {
         shake.duration = 0.42
         shake.timingFunction = CAMediaTimingFunction(name: .easeOut)
         layer.add(shake, forKey: "shake")
+    }
+
+    /// The status line speaks up for reminders and the puzzle, and stays quiet on a confirmation.
+    private func styleStatus(quiet: Bool) {
+        statusLabel.font = Theme.rounded(quiet ? textSize * 0.75 : textSize, quiet ? .regular : .medium)
+        statusLabel.textColor = quiet ? Theme.muted : Theme.ink.withAlphaComponent(0.8)
     }
 
     private func label(_ text: String, size: CGFloat, weight: NSFont.Weight,
@@ -1615,12 +1625,12 @@ final class MenuHeader: NSView {
     private let detail = NSTextField(wrappingLabelWithString: "")
 
     init() {
-        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 138))
+        super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 150))
         time.font = Theme.digits(30, .bold)
         time.textColor = .labelColor
         detail.font = NSFont.systemFont(ofSize: 11.5)
         detail.textColor = .secondaryLabelColor
-        detail.maximumNumberOfLines = 2
+        detail.maximumNumberOfLines = 3
         detail.preferredMaxLayoutWidth = 268
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -1850,6 +1860,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
             },
             {
                 save(self.overlays.first?.contentView, "5-puzzle-wrong")
+                self.puzzle = nil
+                self.canvas = Canvas()
+                self.buildOverlays()
+                self.render()
+            },
+            {
+                save(self.overlays.first?.contentView, "8-closed-with-canvas")
                 for (name, appearance) in [("6-menu-dark", NSAppearance.Name.darkAqua), ("6-menu-light", .aqua)] {
                     self.menuHeader.appearance = NSAppearance(named: appearance)
                     self.refreshMenuHeader()
@@ -2010,7 +2027,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, Overla
             ? "Session ends after \(Config.wallTime(in: left)) · \(Config.duration(left)) to go"
             : "Session ends at the next confirmation"
         let rounds = Store.closedRounds
-        if rounds > 0 { line += " · \(rounds) Closed \(rounds == 1 ? "round" : "rounds") so far" }
+        if rounds > 0 { line += "\n\(rounds) Closed \(rounds == 1 ? "round" : "rounds") so far, \(Store.closedMinutes) min in all" }
         return line
     }
 
