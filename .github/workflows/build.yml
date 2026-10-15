@@ -32,6 +32,7 @@ jobs:
           build/CountdownOverlay.app/Contents/MacOS/CountdownOverlay --help
           lipo -info build/CountdownOverlay.app/Contents/MacOS/CountdownOverlay
           test -s build/CountdownOverlay.app/Contents/Resources/Canvas.html
+          test -s build/CountdownOverlay.app/Contents/Resources/AppIcon.icns
           /usr/libexec/PlistBuddy -c 'Print CountdownCommit' build/CountdownOverlay.app/Contents/Info.plist
       - uses: actions/upload-artifact@v4
         with:
